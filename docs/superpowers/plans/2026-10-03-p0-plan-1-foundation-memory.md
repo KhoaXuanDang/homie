@@ -366,7 +366,7 @@ curl -s -u "$ID:$SECRET" "$DOMAIN/oauth2/token" \
   -d resource=https://example.trycloudflare.com/mcp
 ```
 
-Expected: JSON with `access_token`. Record: success or the exact error. Decode the token at a JWT debugger (or `cut -d. -f2 | base64 -d`) and record the `scope` claim string exactly (expected `homie/mcp:service`).
+Expected: JSON with `access_token`. Record: success or the exact error. Decode the token at a JWT debugger (or `cut -d. -f2 | base64 -d`) and record the `scope` claim string exactly (expected `homie/mcp:service`) and that `client_id` and `token_use` are present (`verify_token` requires both).
 
 - [ ] **Step 2: Does Alexa accept the prefixed scope names?**
 
@@ -830,6 +830,11 @@ def test_mcp_requires_token_without_www_authenticate(client):
     assert "www-authenticate" not in res.headers
 
 
+def test_api_rejects_service_token(client, make_token):
+    res = client.get("/api/memories", headers={"Authorization": f"Bearer {make_token(scope=SERVICE)}"})
+    assert res.status_code == 401
+
+
 def test_api_rate_limited(client, make_token, monkeypatch):
     from app.ratelimit import api_limiter
 
@@ -839,7 +844,7 @@ def test_api_rate_limited(client, make_token, monkeypatch):
     assert client.get("/api/memories", headers=headers).status_code == 429
 ```
 
-(The last three tests pass only after Tasks 6–7 add the routes; they are written here so the auth contract lives in one file. Run them again at the end of Task 7.)
+(The last four tests pass only after Tasks 6–7 add the routes; they are written here so the auth contract lives in one file. Run them again at the end of Task 7.)
 
 - [ ] **Step 8: Run unit tests to see them fail**
 
@@ -938,7 +943,7 @@ class McpAuthGate:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
+        if scope["type"] == "http" and scope["path"].startswith("/mcp"):
             headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope["headers"]}
             try:
                 token = bearer_token(headers)
@@ -1080,7 +1085,7 @@ def add(sub, content, kind="fact", tags=()):
 
 
 def test_create_and_get(ddb):
-    m = add("a", "  passport is in the top desk drawer  ", "item_location", ["Travel"])
+    m = add("a", "  passport is in the top desk drawer  ", "item_location", ["Travel", "travel"])
     assert m.content == "passport is in the top desk drawer"
     assert m.tags == ["travel"]
     assert memory.get_memory("a", m.id) == m
@@ -1174,27 +1179,28 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints
 
 Kind = Literal["item_location", "fact", "preference", "todo"]
 Content = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
 Tag = Annotated[
     str, StringConstraints(strip_whitespace=True, to_lower=True, min_length=1, max_length=40)
 ]
+Tags = Annotated[list[Tag], Field(max_length=10), AfterValidator(lambda t: list(dict.fromkeys(t)))]
 EventId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1024)]
 
 
 class MemoryCreate(BaseModel):
     kind: Kind
     content: Content
-    tags: list[Tag] = Field(default_factory=list, max_length=10)
+    tags: Tags = []
     event_id: EventId | None = None
 
 
 class MemoryUpdate(BaseModel):
     kind: Kind | None = None
     content: Content | None = None
-    tags: list[Tag] | None = Field(default=None, max_length=10)
+    tags: Tags | None = None
     event_id: EventId | None = None  # explicit null clears the event link
 
 
@@ -1259,6 +1265,7 @@ def _tokens(text: str) -> set[str]:
 
 
 def _matches(memories: list[Memory], query: str) -> list[Memory]:
+    # dev-note: keyword-overlap count; swap for BM25 or embeddings when recall gets noisy.
     wanted = _tokens(query)
     scored = []
     for m in memories:
@@ -1743,6 +1750,7 @@ app.include_router(health.router)
 app.include_router(wellknown.router)
 app.include_router(memories.router)
 # Register every router above this line: the MCP app is mounted at "/" and catches the rest.
+# The endpoint is still /mcp: that is the SDK's default streamable_http_path (Mount("/mcp") would give /mcp/mcp).
 app.mount("/", mcp_app)
 ```
 
@@ -1937,6 +1945,9 @@ import { env } from "@/lib/env"
 
 import type { paths } from "./schema"
 
+// dev-note: one redirect per page load; concurrent 401s would otherwise each start one.
+let redirecting = false
+
 export function useApi() {
   const auth = useAuth()
   const token = auth.user?.access_token
@@ -1951,7 +1962,10 @@ export function useApi() {
       },
       onResponse({ response }) {
         // Expired or revoked session: send the user back through sign-in.
-        if (response.status === 401) void signIn()
+        if (response.status === 401 && !redirecting) {
+          redirecting = true
+          void signIn()
+        }
         return response
       },
     })
