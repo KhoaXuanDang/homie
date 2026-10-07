@@ -1,3 +1,4 @@
+from asyncio import Lock
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,7 @@ from app.services.memory_service import MemoryNotFoundError
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    app.state.database_lock = Lock()
     try:
         await run_in_threadpool(init_db)
         yield

@@ -1,4 +1,6 @@
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 from fastapi import Request
@@ -8,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app import db, main
 from app.config import settings
 from app.middleware.auth import RateLimiter, get_user_sub
+from app.models.db import MemoryRecord
 from app.services.memory_service import MemoryService
 
 
@@ -172,6 +175,47 @@ def test_rate_limit(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None
     assert client.get("/health").status_code == 200
     now[0] += 60
     assert client.get("/memories", headers=auth()).status_code == 200
+
+
+def test_overlapping_read_does_not_rollback_create(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    insert_pending, read_started, release_insert = Event(), Event(), Event()
+    original_commit = Session.commit
+    original_check = main.app.state.rate_limiter.check
+
+    def pause_commit(session: Session) -> None:
+        if any(isinstance(record, MemoryRecord) for record in session.new):
+            session.flush()
+            insert_pending.set()
+            assert release_insert.wait(5)
+        original_commit(session)
+
+    def check_rate(user_sub: str) -> None:
+        original_check(user_sub)
+        if user_sub == "bob":
+            read_started.set()
+
+    monkeypatch.setattr(Session, "commit", pause_commit)
+    monkeypatch.setattr(main.app.state.rate_limiter, "check", check_rate)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        create = workers.submit(
+            client.post,
+            "/memories",
+            headers=auth(),
+            json={"content": "Keep this memory", "memory_type": "fact"},
+        )
+        try:
+            assert insert_pending.wait(5)
+            read = workers.submit(client.get, "/memories", headers=auth("bob"))
+            assert read_started.wait(5)
+            with pytest.raises(TimeoutError):
+                read.result(timeout=0.1)
+        finally:
+            release_insert.set()
+        assert create.result(timeout=5).status_code == 201
+        assert read.result(timeout=5).status_code == 200
+    assert len(client.get("/memories", headers=auth()).json()) == 1
 
 
 def test_unexpected_errors_are_safe(

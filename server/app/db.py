@@ -1,9 +1,12 @@
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 
+from fastapi import Request
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
 from app.models.db import Base
@@ -30,10 +33,16 @@ def init_db() -> None:
     Base.metadata.create_all(engine)
 
 
-def get_session() -> Iterator[Session]:
-    with SessionLocal() as session:
+async def get_session(request: Request) -> AsyncIterator[Session]:
+    session = SessionLocal()
+    async with AsyncExitStack() as stack:
         try:
+            if isinstance(session.get_bind().pool, StaticPool):
+                # One in-memory connection must not share overlapping transactions.
+                await stack.enter_async_context(request.app.state.database_lock)
             yield session
         except Exception:
-            session.rollback()
+            await run_in_threadpool(session.rollback)
             raise
+        finally:
+            await run_in_threadpool(session.close)

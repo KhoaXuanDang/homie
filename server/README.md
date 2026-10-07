@@ -7,6 +7,8 @@ The app creates missing tables at startup and closes database connections at shu
 Configuration is loaded from `server/.env` (see `.env.example`). `DATABASE_URL`
 defaults to `sqlite:///./homie.db`. Other synchronous SQLAlchemy database URLs
 require their corresponding driver; tag filtering currently requires SQLite.
+SQLite in-memory URLs share a connection across workers; request session lifetimes
+are serialized to prevent overlapping transactions on that connection.
 Schema changes to an existing database require migrations; automatic table creation
 does not alter existing tables. Alembic and real Alexa authentication are deferred.
 

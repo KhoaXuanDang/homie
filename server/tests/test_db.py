@@ -1,6 +1,8 @@
+from asyncio import Lock, run
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from fastapi import FastAPI, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -43,8 +45,15 @@ def test_session_rolls_back_and_closes(monkeypatch: pytest.MonkeyPatch, session:
     monkeypatch.setattr("app.db.SessionLocal", lambda: session)
     monkeypatch.setattr(session, "rollback", lambda: calls.append("rollback"))
     monkeypatch.setattr(session, "close", lambda: calls.append("close"))
-    dependency = get_session()
-    assert next(dependency) is session
-    with pytest.raises(RuntimeError, match="failure"):
-        dependency.throw(RuntimeError("failure"))
+
+    async def use_dependency() -> None:
+        app = FastAPI()
+        app.state.database_lock = Lock()
+        request = Request({"type": "http", "app": app})
+        dependency = get_session(request)
+        assert await anext(dependency) is session
+        with pytest.raises(RuntimeError, match="failure"):
+            await dependency.athrow(RuntimeError("failure"))
+
+    run(use_dependency())
     assert calls == ["rollback", "close"]
