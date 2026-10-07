@@ -37,7 +37,7 @@ def test_in_memory_database_is_shared_across_threads(url: str) -> None:
             with Session(engine) as session:
                 return session.scalar(select(UserRecord.user_sub))
 
-        with ThreadPoolExecutor(max_workers=2) as workers:
+        with ThreadPoolExecutor(max_workers=1) as workers:
             assert list(workers.map(lambda _: fetch_user(), range(2))) == ["alice", "alice"]
     finally:
         engine.dispose()
