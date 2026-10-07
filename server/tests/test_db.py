@@ -18,6 +18,9 @@ from app.models.db import Base, UserRecord
         "sqlite:///:memory:",
         "sqlite+pysqlite://",
         "sqlite+pysqlite:///:memory:",
+        "sqlite:///file::memory:?uri=true",
+        "sqlite+pysqlite:///file::memory:?uri=true",
+        "sqlite:///file:%3Amemory%3A?uri=true",
         "sqlite:///file:homie-test?mode=memory&cache=shared&uri=true",
     ],
 )

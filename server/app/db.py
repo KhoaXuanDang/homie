@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
+from urllib.parse import unquote
 
 from fastapi import Request
 from sqlalchemy import create_engine
@@ -16,7 +17,8 @@ def create_db_engine(database_url: str) -> Engine:
     url = make_url(database_url)
     is_sqlite = url.get_backend_name() == "sqlite"
     in_memory = is_sqlite and (
-        url.database in {None, "", ":memory:"} or url.query.get("mode") == "memory"
+        unquote(url.database or "") in {"", ":memory:", "file::memory:"}
+        or url.query.get("mode") == "memory"
     )
     return create_engine(
         url,
