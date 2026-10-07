@@ -130,6 +130,7 @@ def test_invalid_update(client: TestClient, data: dict[str, object]) -> None:
     "query",
     [
         "skip=-1",
+        f"skip={2**63}",
         "limit=0",
         "limit=101",
         "limit=no",

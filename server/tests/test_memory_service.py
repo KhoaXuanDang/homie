@@ -103,7 +103,7 @@ def test_invalid_create(
     assert service.list_memories("alice") == []
 
 
-@pytest.mark.parametrize(("skip", "limit"), [(-1, 10), (0, 0), (0, 101)])
+@pytest.mark.parametrize(("skip", "limit"), [(-1, 10), (0, 0), (0, 101), (2**63, 10)])
 def test_invalid_pagination(service: MemoryService, skip: int, limit: int) -> None:
     with pytest.raises(ValidationError):
         service.list_memories("alice", skip, limit)

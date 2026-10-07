@@ -41,7 +41,7 @@ Content is trimmed and bounded to 1–10,000 characters; `memory_type` is a
 nonempty string of up to 50 characters. Tags are at most 20 nonempty strings of
 up to 50 characters each, trimmed and deduplicated, with case preserved.
 Repeated content creates separate memories with different IDs.
-List supports `skip >= 0`, `1 <= limit <= 100` (default 50), and repeated `tags`
+List supports `0 <= skip <= 2**63 - 1`, `1 <= limit <= 100` (default 50), and repeated `tags`
 query parameters. All specified tags must match exactly, before pagination.
 Results are ordered newest first with an ID tie-breaker.
 

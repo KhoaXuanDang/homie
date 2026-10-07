@@ -24,7 +24,7 @@ def create_memory(
 def list_memories(
     user_sub: UserSubDependency,
     session: SessionDependency,
-    skip: Annotated[int, Query(ge=0)] = 0,
+    skip: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     tags: Annotated[Tags | None, Query()] = None,
 ) -> list[Memory]:

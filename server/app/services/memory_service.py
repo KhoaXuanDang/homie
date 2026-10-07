@@ -82,7 +82,7 @@ class MemoryService:
         self, user_sub: str, skip: int = 0, limit: int = 50, tags: list[str] | None = None
     ) -> list[Memory]:
         user_sub = self._validate_sub(user_sub)
-        TypeAdapter(Annotated[int, Field(ge=0)]).validate_python(skip)
+        TypeAdapter(Annotated[int, Field(ge=0, le=2**63 - 1)]).validate_python(skip)
         TypeAdapter(Annotated[int, Field(ge=1, le=100)]).validate_python(limit)
         statement = select(MemoryRecord).where(MemoryRecord.user_sub == user_sub)
         if tags is not None:
