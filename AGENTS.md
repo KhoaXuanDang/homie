@@ -6,7 +6,8 @@ Guide for AI agents (and humans) working in this repo.
 
 **homie** — an Alexa+ memory assistant for the [Amazon Developer Hackathon 2026](https://amazonappdev2026.devpost.com/) (Alexa+ track).
 Users tell Alexa things to remember (where items are, preferences, to-dos); Alexa uses that memory with Google Maps and
-Google Calendar to suggest places/routes and create reminders. A web dashboard lets users see and control what is stored.
+Google Calendar to suggest places/routes and create reminders. A mobile-first Next.js PWA lets users see and control
+what is stored, with responsive desktop support. P0 is online-first, with installation and an offline fallback screen.
 
 Alexa+ integrations go through **MCP** (spec 2025-11-25 or later, **Streamable HTTP** transport). The backend is that MCP server.
 
@@ -71,9 +72,18 @@ Before saying a change is done: run the test + lint commands for every package y
 
 ### Checklist for every client UI change
 
-- **Responsive:** works from phone width (~375px) to desktop; no horizontal scroll; tap targets ≥ 44px.
+- **Mobile-first:** design for phone width (~375px) first, then desktop; no page-level horizontal scroll; tap targets
+  ≥ 44px. Account for safe-area insets, dynamic viewport height, and the on-screen keyboard. Keep form actions reachable.
 - **User-friendly:** loading, empty and error states for every data view; confirm destructive actions (delete
   memory/media, disconnect Google); plain-language error messages; keyboard accessible with visible focus and labels.
+- **PWA:** test relevant flows in browser and installed modes on iOS and Android. Shell/auth changes must cover install,
+  cold launch, OAuth return, sign-out, expired sessions, offline/reconnect, and updates on a production build over HTTPS.
+- **Connectivity and privacy:** P0 writes require connectivity; no offline mutation queue or background sync. Preserve
+  form input after request failures and distinguish offline from an empty result. Never persist private API responses,
+  tokens, OAuth callbacks, or signed media URLs in service-worker caches. Scope query caches to the signed-in user and
+  clear them on sign-out/account changes. Auth-library token storage is separate from service-worker caching.
+- **Updates:** provide a reload action for a new service-worker version; do not reload over an unsaved form or upload.
+  Keep offline data synchronization and web push out of P0 unless explicitly added to the scope.
 
 ## Git workflow
 
