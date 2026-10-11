@@ -82,7 +82,8 @@ Before saying a change is done: run the test + lint commands for every package y
   form input after request failures and distinguish offline from an empty result. Never persist private API responses,
   tokens, OAuth callbacks, or signed media URLs in service-worker caches. Scope query caches to the signed-in user and
   clear them on sign-out/account changes. Auth-library token storage is separate from service-worker caching.
-- **Updates:** provide a reload action for a new service-worker version; do not reload over an unsaved form or upload.
+- **Updates:** app releases take effect on normal user-initiated refreshes; the service worker handles offline fallback
+  only. No update prompts, forced reloads or cross-tab update coordination in P0; drafts do not survive a manual refresh.
   Keep offline data synchronization and web push out of P0 unless explicitly added to the scope.
 
 ## Git workflow
