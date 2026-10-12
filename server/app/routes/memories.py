@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_session
 from app.middleware.auth import get_user_sub
-from app.models.memory import Memory, MemoryCreate, MemoryUpdate, Tags
+from app.models.memory import Limit, Memory, MemoryCreate, MemoryUpdate, Skip, Tags
 from app.services.memory_service import MemoryService
 
 router = APIRouter(prefix="/memories", tags=["memories"])
@@ -24,8 +24,8 @@ def create_memory(
 def list_memories(
     user_sub: UserSubDependency,
     session: SessionDependency,
-    skip: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    skip: Annotated[Skip, Query()] = 0,
+    limit: Annotated[Limit, Query()] = 50,
     tags: Annotated[Tags | None, Query()] = None,
 ) -> list[Memory]:
     return MemoryService(session).list_memories(user_sub, skip, limit, tags)

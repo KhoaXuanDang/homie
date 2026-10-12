@@ -110,6 +110,35 @@ def test_invalid_create(
     assert service.list_memories("alice") == []
 
 
+def test_list_memories_does_not_rebuild_type_adapters(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pydantic
+
+    original_init = pydantic.TypeAdapter.__init__
+    adapter_inits: list[tuple[object, ...]] = []
+
+    def tracking_init(self: object, *args: object, **kwargs: object) -> None:
+        adapter_inits.append(args)
+        original_init(self, *args, **kwargs)
+
+    service.create_memory("alice", "Test memory", "fact", ["tag1"])
+    monkeypatch.setattr(pydantic.TypeAdapter, "__init__", tracking_init)
+
+    memories = service.list_memories("alice", skip=0, limit=10, tags=["tag1"])
+    assert len(memories) == 1
+    assert adapter_inits == []
+
+
+def test_module_level_adapters_defined() -> None:
+    from app.services import memory_service
+
+    assert hasattr(memory_service, "_user_sub_adapter")
+    assert hasattr(memory_service, "_skip_adapter")
+    assert hasattr(memory_service, "_limit_adapter")
+    assert hasattr(memory_service, "_tags_adapter")
+
+
 @pytest.mark.parametrize(("skip", "limit"), [(-1, 10), (0, 0), (0, 101), (2**63, 10)])
 def test_invalid_pagination(service: MemoryService, skip: int, limit: int) -> None:
     with pytest.raises(ValidationError):
