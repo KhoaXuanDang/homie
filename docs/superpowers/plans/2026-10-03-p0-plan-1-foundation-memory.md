@@ -3120,3 +3120,8 @@ git push -u origin feat/p0-foundation-memory   # ask before pushing
 gh pr create -B main -t "feat: P0 foundation + memory (Cognito auth, MCP memory tools, dashboard)" \
   -b "Implements Plan 1 (docs/superpowers/plans/2026-10-03-p0-plan-1-foundation-memory.md). Manual check results: <paste Step 2 results>"
 ```
+
+- [ ] **Final step after production deployment (Plan 4): Homepage QR code**
+
+Use a QR generator website to create a static QR code linking to homie's deployed HTTPS homepage. Scan it on a phone
+to verify the link before sharing it for the demo. This is a manual post-deployment task; no app implementation is needed.
