@@ -10,6 +10,7 @@ from app.models.db import MemoryRecord, UserRecord, utc_now
 from app.models.memory import Memory, MemoryCreate, MemoryUpdate, Tags
 from app.models.user import Profile, UserSub
 
+
 class MemoryNotFoundError(Exception):
     pass
 
