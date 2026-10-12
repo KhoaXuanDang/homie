@@ -10,11 +10,6 @@ from app.models.db import MemoryRecord, UserRecord, utc_now
 from app.models.memory import Memory, MemoryCreate, MemoryUpdate, Tags
 from app.models.user import Profile, UserSub
 
-SUB_ADAPTER = TypeAdapter(UserSub)
-SKIP_ADAPTER = TypeAdapter(Annotated[int, Field(ge=0, le=2**63 - 1)])
-LIMIT_ADAPTER = TypeAdapter(Annotated[int, Field(ge=1, le=100)])
-TAGS_ADAPTER = TypeAdapter(Tags)
-
 
 class MemoryNotFoundError(Exception):
     pass
@@ -29,7 +24,7 @@ class MemoryService:
         self.session = session
 
     def _validate_sub(self, user_sub: str) -> str:
-        return SUB_ADAPTER.validate_python(user_sub)
+        return TypeAdapter(UserSub).validate_python(user_sub)
 
     def _get_record(self, user_sub: str, memory_id: str) -> MemoryRecord:
         user_sub = self._validate_sub(user_sub)
@@ -94,11 +89,11 @@ class MemoryService:
         self, user_sub: str, skip: int = 0, limit: int = 50, tags: list[str] | None = None
     ) -> list[Memory]:
         user_sub = self._validate_sub(user_sub)
-        skip = SKIP_ADAPTER.validate_python(skip)
-        limit = LIMIT_ADAPTER.validate_python(limit)
+        TypeAdapter(Annotated[int, Field(ge=0, le=2**63 - 1)]).validate_python(skip)
+        TypeAdapter(Annotated[int, Field(ge=1, le=100)]).validate_python(limit)
         statement = select(MemoryRecord).where(MemoryRecord.user_sub == user_sub)
         if tags is not None:
-            tags = TAGS_ADAPTER.validate_python(tags)
+            tags = TypeAdapter(Tags).validate_python(tags)
             if tags and self.session.get_bind().dialect.name != "sqlite":
                 raise UnsupportedFilterError
             for tag in dict.fromkeys(tags):

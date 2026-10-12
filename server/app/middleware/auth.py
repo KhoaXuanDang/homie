@@ -1,4 +1,4 @@
-from collections import OrderedDict, deque
+from collections import deque
 from threading import Lock
 from time import monotonic
 from typing import Annotated
@@ -11,28 +11,27 @@ from app.config import settings
 from app.models.user import UserSub
 
 bearer = HTTPBearer(auto_error=False)
-SUB_ADAPTER = TypeAdapter(UserSub)
 
 
 class RateLimiter:
     def __init__(self) -> None:
-        self.requests: OrderedDict[str, deque[float]] = OrderedDict()
-        self.next_sweep = 0.0
+        self.requests: dict[str, deque[float]] = {}
         self.lock = Lock()
 
     def check(self, user_sub: str) -> None:
         with self.lock:
             now = monotonic()
-            if now >= self.next_sweep:
+            if user_sub not in self.requests:
                 for sub in list(self.requests):
                     if self.requests[sub][-1] <= now - 60:
                         del self.requests[sub]
-                self.next_sweep = now + 60
-            if user_sub not in self.requests:
                 if len(self.requests) >= 10000:
-                    self.requests.popitem(last=False)
+                    raise HTTPException(
+                        429,
+                        "Too many requests. Please try again in a minute.",
+                        headers={"Retry-After": "60"},
+                    )
                 self.requests[user_sub] = deque()
-            self.requests.move_to_end(user_sub)
             timestamps = self.requests[user_sub]
             while timestamps and timestamps[0] <= now - 60:
                 timestamps.popleft()
@@ -59,7 +58,7 @@ def get_user_sub(
     if not settings.allow_mock_auth:
         raise HTTPException(503, "Authentication is not configured.")
     try:
-        user_sub = SUB_ADAPTER.validate_python(credentials.credentials)
+        user_sub = TypeAdapter(UserSub).validate_python(credentials.credentials)
         if any(character.isspace() for character in user_sub):
             raise ValueError("Invalid token")
     except (ValidationError, ValueError) as exc:

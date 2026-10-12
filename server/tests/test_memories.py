@@ -186,26 +186,6 @@ def test_rate_limit(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None
     assert client.get("/memories", headers=auth()).status_code == 200
 
 
-def test_rate_limiter_evicts_oldest_and_sweeps_periodically(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = [100.0]
-    monkeypatch.setattr("app.middleware.auth.monotonic", lambda: now[0])
-    limiter = RateLimiter()
-    for i in range(10000):
-        limiter.check(str(i))
-    limiter.check("0")
-    limiter.check("new-user")
-    assert len(limiter.requests) == 10000
-    assert "1" not in limiter.requests
-    assert "0" in limiter.requests
-    assert "new-user" in limiter.requests
-    assert limiter.next_sweep == 160
-    now[0] += 60
-    limiter.check("another-user")
-    assert list(limiter.requests) == ["another-user"]
-
-
 def test_overlapping_read_does_not_rollback_create(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
