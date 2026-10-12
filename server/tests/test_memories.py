@@ -1,17 +1,14 @@
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
 
 import pytest
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session, sessionmaker
 
-from app import db, main
+from app import main
 from app.config import Settings, settings
 from app.middleware.auth import RateLimiter, get_user_sub
-from app.models.db import MemoryRecord
-from app.services.memory_service import MemoryService, UnsupportedFilterError
+from app.services.memory_service import MemoryService
 
 
 def auth(user_sub: str = "alice") -> dict[str, str]:
@@ -19,10 +16,7 @@ def auth(user_sub: str = "alice") -> dict[str, str]:
 
 
 @pytest.fixture
-def client(session: Session, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
-    monkeypatch.setattr(db, "SessionLocal", sessionmaker(bind=session.get_bind()))
-    monkeypatch.setattr(main, "engine", session.get_bind())
-    monkeypatch.setattr(main, "init_db", lambda: db.Base.metadata.create_all(session.get_bind()))
+def client(ddb_table: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setattr(main.app.state, "rate_limiter", RateLimiter())
     monkeypatch.setattr(settings, "jwt_secret", "")
     monkeypatch.setattr(settings, "allow_mock_auth", True)
@@ -248,27 +242,7 @@ def test_many_users_do_not_lock_out_new_users(
         assert response.status_code == 200
 
 
-def test_overlapping_read_does_not_rollback_create(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    insert_pending, read_started, release_insert = Event(), Event(), Event()
-    original_commit = Session.commit
-    original_check = main.app.state.rate_limiter.check
-
-    def pause_commit(session: Session) -> None:
-        if any(isinstance(record, MemoryRecord) for record in session.new):
-            session.flush()
-            insert_pending.set()
-            assert release_insert.wait(5)
-        original_commit(session)
-
-    def check_rate(user_sub: str) -> None:
-        original_check(user_sub)
-        if user_sub == "bob":
-            read_started.set()
-
-    monkeypatch.setattr(Session, "commit", pause_commit)
-    monkeypatch.setattr(main.app.state.rate_limiter, "check", check_rate)
+def test_concurrent_create_and_read(client: TestClient) -> None:
     with ThreadPoolExecutor(max_workers=2) as workers:
         create = workers.submit(
             client.post,
@@ -276,14 +250,7 @@ def test_overlapping_read_does_not_rollback_create(
             headers=auth(),
             json={"content": "Keep this memory", "memory_type": "fact"},
         )
-        try:
-            assert insert_pending.wait(5)
-            read = workers.submit(client.get, "/memories", headers=auth("bob"))
-            assert read_started.wait(5)
-            with pytest.raises(TimeoutError):
-                read.result(timeout=0.1)
-        finally:
-            release_insert.set()
+        read = workers.submit(client.get, "/memories", headers=auth("bob"))
         assert create.result(timeout=5).status_code == 201
         assert read.result(timeout=5).status_code == 200
     assert len(client.get("/memories", headers=auth()).json()) == 1
@@ -351,18 +318,6 @@ def test_validation_details_do_not_echo_values(
     assert error["msg"] == message
     assert set(error) == {"loc", "msg", "type"}
     assert "private" not in response.text
-
-
-def test_unsupported_tag_filter_returns_400(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def unsupported(*args: object, **kwargs: object) -> None:
-        raise UnsupportedFilterError
-
-    monkeypatch.setattr(MemoryService, "list_memories", unsupported)
-    response = client.get("/memories?tags=home", headers=auth())
-    assert response.status_code == 400
-    assert response.json() == {"detail": "Tag filtering is not supported on this database."}
 
 
 def test_auth_attaches_request_state(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

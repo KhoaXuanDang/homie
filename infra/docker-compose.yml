@@ -1,14 +1,22 @@
 services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    command: "-jar DynamoDBLocal.jar -sharedDb"
+    ports: ["8001:8000"]
+
   server:
     build:
       context: ../server
       dockerfile: ../infra/docker/server.Dockerfile
     env_file: ../server/.env
     environment:
-      DATABASE_URL: sqlite:////data/homie.db
-    volumes:
-      - homie-data:/data
+      AWS_REGION: us-east-1
+      DYNAMODB_TABLE: homie-local
+      DYNAMODB_ENDPOINT_URL: http://dynamodb:8000
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
     ports: ["8000:8000"]
+    depends_on: [dynamodb]
 
   client:
     build:
@@ -19,5 +27,3 @@ services:
     ports: ["3000:3000"]
     depends_on: [server]
 
-volumes:
-  homie-data:

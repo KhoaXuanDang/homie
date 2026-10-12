@@ -1,19 +1,54 @@
 from collections.abc import Iterator
+from typing import Any
 
+import boto3
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
+from moto import mock_aws
 
-from app.models.db import Base
+from app.config import settings
+
+
+@pytest.fixture(autouse=True)
+def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for k, v in {
+        "AWS_ACCESS_KEY_ID": "testing",
+        "AWS_SECRET_ACCESS_KEY": "testing",
+        "AWS_SESSION_TOKEN": "testing",
+        "AWS_DEFAULT_REGION": "us-east-1",
+    }.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.setattr(settings, "aws_region", "us-east-1")
+    monkeypatch.setattr(settings, "dynamodb_table", "homie-test")
+    monkeypatch.setattr(settings, "dynamodb_endpoint_url", None)
 
 
 @pytest.fixture
-def session() -> Iterator[Session]:
-    engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-    )
-    Base.metadata.create_all(engine)
-    with Session(engine, expire_on_commit=False) as session:
-        yield session
-    engine.dispose()
+def ddb_table() -> Iterator[Any]:
+    with mock_aws():
+        dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
+        table = dynamodb.create_table(
+            TableName=settings.dynamodb_table,
+            KeySchema=[
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        yield table
+
+
+@pytest.fixture
+def ddb(ddb_table: Any) -> Any:
+    return ddb_table
+
+
+@pytest.fixture
+def service(ddb_table: Any) -> Any:
+    from app.services.memory_service import MemoryService
+
+    return MemoryService(table=ddb_table)
