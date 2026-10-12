@@ -7,6 +7,8 @@ Content = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, 
 MemoryType = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
 Tag = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
 Tags = Annotated[list[Tag], Field(max_length=20)]
+Skip = Annotated[int, Field(ge=0, le=2**63 - 1)]
+Limit = Annotated[int, Field(ge=1, le=100)]
 
 
 class MemoryCreate(BaseModel):
