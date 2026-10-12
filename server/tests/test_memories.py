@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
 import pytest
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -184,6 +184,68 @@ def test_rate_limit(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None
     assert client.get("/health").status_code == 200
     now[0] += 60
     assert client.get("/memories", headers=auth()).status_code == 200
+
+
+def test_rate_limiter_eviction_and_no_lockout() -> None:
+    limiter = RateLimiter(max_requests=2, window_seconds=60.0, max_entries=3, cleanup_interval=10.0)
+    limiter.check("user1")
+    limiter.check("user2")
+    limiter.check("user3")
+    assert len(limiter.requests) == 3
+    assert list(limiter.requests.keys()) == ["user1", "user2", "user3"]
+
+    # 4th user arrives: user1 evicted (LRU), user4 admitted without lockout
+    limiter.check("user4")
+    assert len(limiter.requests) == 3
+    assert "user1" not in limiter.requests
+    assert list(limiter.requests.keys()) == ["user2", "user3", "user4"]
+
+    # user4 can make another request within its quota
+    limiter.check("user4")
+    # user4 3rd request hits per-user limit
+    with pytest.raises(HTTPException) as exc_info:
+        limiter.check("user4")
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.headers == {"Retry-After": "60"}
+
+
+def test_rate_limiter_cleanup_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [100.0]
+    monkeypatch.setattr("app.middleware.auth.monotonic", lambda: now[0])
+    limiter = RateLimiter(
+        max_requests=5, window_seconds=60.0, max_entries=10, cleanup_interval=10.0
+    )
+    limiter.check("user1")
+    now[0] = 105.0
+    limiter.check("user2")
+
+    # At now = 161.0, user1 expired (161 - 100 > 60), user2 not expired (161 - 105 <= 60)
+    now[0] = 161.0
+    limiter.check("user3")
+    assert "user1" not in limiter.requests
+    assert "user2" in limiter.requests
+    assert "user3" in limiter.requests
+
+
+def test_rate_limiter_concurrent_access() -> None:
+    limiter = RateLimiter(max_requests=50, window_seconds=60.0, max_entries=100)
+
+    def worker(user_id: int) -> None:
+        for _ in range(10):
+            limiter.check(f"user_{user_id}")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(worker, range(20)))
+    assert len(limiter.requests) == 20
+
+
+def test_many_users_do_not_lock_out_new_users(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.app.state, "rate_limiter", RateLimiter(max_entries=5))
+    for i in range(15):
+        response = client.get("/memories", headers=auth(f"user_{i}"))
+        assert response.status_code == 200
 
 
 def test_overlapping_read_does_not_rollback_create(

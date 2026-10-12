@@ -1,14 +1,19 @@
-from typing import Annotated, Any
+from typing import Any
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, TypeAdapter
+from pydantic import TypeAdapter
 from sqlalchemy import exists, func, select
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
 from app.models.db import MemoryRecord, UserRecord, utc_now
-from app.models.memory import Memory, MemoryCreate, MemoryUpdate, Tags
+from app.models.memory import Limit, Memory, MemoryCreate, MemoryUpdate, Skip, Tags
 from app.models.user import Profile, UserSub
+
+_user_sub_adapter = TypeAdapter(UserSub)
+_skip_adapter = TypeAdapter(Skip)
+_limit_adapter = TypeAdapter(Limit)
+_tags_adapter = TypeAdapter(Tags)
 
 
 class MemoryNotFoundError(Exception):
@@ -24,7 +29,7 @@ class MemoryService:
         self.session = session
 
     def _validate_sub(self, user_sub: str) -> str:
-        return TypeAdapter(UserSub).validate_python(user_sub)
+        return _user_sub_adapter.validate_python(user_sub)
 
     def _get_record(self, user_sub: str, memory_id: str) -> MemoryRecord:
         user_sub = self._validate_sub(user_sub)
@@ -89,11 +94,11 @@ class MemoryService:
         self, user_sub: str, skip: int = 0, limit: int = 50, tags: list[str] | None = None
     ) -> list[Memory]:
         user_sub = self._validate_sub(user_sub)
-        TypeAdapter(Annotated[int, Field(ge=0, le=2**63 - 1)]).validate_python(skip)
-        TypeAdapter(Annotated[int, Field(ge=1, le=100)]).validate_python(limit)
+        _skip_adapter.validate_python(skip)
+        _limit_adapter.validate_python(limit)
         statement = select(MemoryRecord).where(MemoryRecord.user_sub == user_sub)
         if tags is not None:
-            tags = TypeAdapter(Tags).validate_python(tags)
+            tags = _tags_adapter.validate_python(tags)
             if tags and self.session.get_bind().dialect.name != "sqlite":
                 raise UnsupportedFilterError
             for tag in dict.fromkeys(tags):
