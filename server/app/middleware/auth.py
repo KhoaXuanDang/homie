@@ -55,6 +55,8 @@ def get_user_sub(
     if settings.jwt_secret:
         # Real Alexa OAuth/JWT verification is a later phase; never accept mock tokens here.
         raise HTTPException(503, "Alexa token validation is not configured.")
+    if not settings.allow_mock_auth:
+        raise HTTPException(503, "Authentication is not configured.")
     try:
         user_sub = TypeAdapter(UserSub).validate_python(credentials.credentials)
         if any(character.isspace() for character in user_sub):

@@ -8,10 +8,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from app import db, main
-from app.config import settings
+from app.config import Settings, settings
 from app.middleware.auth import RateLimiter, get_user_sub
 from app.models.db import MemoryRecord
-from app.services.memory_service import MemoryService
+from app.services.memory_service import MemoryService, UnsupportedFilterError
 
 
 def auth(user_sub: str = "alice") -> dict[str, str]:
@@ -25,6 +25,7 @@ def client(session: Session, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestCl
     monkeypatch.setattr(main, "init_db", lambda: db.Base.metadata.create_all(session.get_bind()))
     monkeypatch.setattr(main.app.state, "rate_limiter", RateLimiter())
     monkeypatch.setattr(settings, "jwt_secret", "")
+    monkeypatch.setattr(settings, "allow_mock_auth", True)
     with TestClient(main.app) as client:
         yield client
 
@@ -99,6 +100,14 @@ def test_mock_auth_disabled(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(settings, "jwt_secret", "nonempty-test-value")
     assert client.get("/memories", headers=auth()).status_code == 503
     assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_mock_auth_requires_opt_in(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ALLOW_MOCK_AUTH", raising=False)
+    assert not Settings(_env_file=None).allow_mock_auth
+    monkeypatch.setattr(settings, "allow_mock_auth", False)
+    assert client.get("/memories", headers=auth()).status_code == 503
+    assert client.get("/health").status_code == 200
 
 
 @pytest.mark.parametrize("field", ["user_sub", "id", "timezone", "created_at", "updated_at"])
@@ -230,6 +239,68 @@ def test_unexpected_errors_are_safe(
     assert response.json() == {"detail": "Something went wrong. Please try again."}
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
     assert "sensitive" not in caplog.text
+    assert "database credentials" not in response.text
+    assert "Unhandled RuntimeError" in caplog.text
+    assert "test_memories.py" in caplog.text
+    assert "in fail" in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "data", "loc", "message"),
+    [
+        (
+            "post",
+            "/memories",
+            {"content": "private" * 1500, "memory_type": "fact"},
+            ["body", "content"],
+            "String should have at most 10000 characters",
+        ),
+        (
+            "post",
+            "/memories",
+            {"content": "private", "memory_type": "fact", "tags": [""]},
+            ["body", "tags", 0],
+            "String should have at least 1 character",
+        ),
+        (
+            "put",
+            "/memories/missing",
+            {},
+            ["body"],
+            "Value error, Provide at least one field to update",
+        ),
+        (
+            "get",
+            "/memories?limit=private",
+            None,
+            ["query", "limit"],
+            "Input should be a valid integer, unable to parse string as an integer",
+        ),
+    ],
+)
+def test_validation_details_do_not_echo_values(
+    client: TestClient, method: str, path: str, data: dict | None, loc: list, message: str
+) -> None:
+    response = client.request(method, path, headers=auth(), json=data)
+    assert response.status_code == 422
+    error = response.json()["errors"][0]
+    assert error["loc"] == loc
+    assert error["msg"] == message
+    assert set(error) == {"loc", "msg", "type"}
+    assert "private" not in response.text
+
+
+def test_unsupported_tag_filter_returns_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unsupported(*args: object, **kwargs: object) -> None:
+        raise UnsupportedFilterError
+
+    monkeypatch.setattr(MemoryService, "list_memories", unsupported)
+    response = client.get("/memories?tags=home", headers=auth())
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Tag filtering is not supported on this database."}
 
 
 def test_auth_attaches_request_state(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import Field, TypeAdapter
 from sqlalchemy import exists, func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
 from app.models.db import MemoryRecord, UserRecord, utc_now
@@ -12,6 +12,10 @@ from app.models.user import Profile, UserSub
 
 
 class MemoryNotFoundError(Exception):
+    pass
+
+
+class UnsupportedFilterError(Exception):
     pass
 
 
@@ -33,15 +37,19 @@ class MemoryService:
             raise MemoryNotFoundError("Memory not found")
         return record
 
-    def _to_memory(self, record: MemoryRecord) -> Memory:
-        user = self.session.scalar(select(UserRecord).where(UserRecord.user_sub == record.user_sub))
-        timezone = Profile.model_validate(user).timezone
+    def _timezone(self, user_sub: str) -> tuple[str, ZoneInfo]:
+        user = self.session.scalar(select(UserRecord).where(UserRecord.user_sub == user_sub))
+        timezone = Profile.model_validate(user).timezone if user is not None else "UTC"
+        return timezone, ZoneInfo(timezone)
+
+    @staticmethod
+    def _to_memory(record: MemoryRecord, timezone: str, zone: ZoneInfo) -> Memory:
         memory = Memory.model_validate(record)
         return memory.model_copy(
             update={
                 "timezone": timezone,
-                "created_at": memory.created_at.astimezone(ZoneInfo(timezone)),
-                "updated_at": memory.updated_at.astimezone(ZoneInfo(timezone)),
+                "created_at": memory.created_at.astimezone(zone),
+                "updated_at": memory.updated_at.astimezone(zone),
             }
         )
 
@@ -50,20 +58,18 @@ class MemoryService:
     ) -> Memory:
         user_sub = self._validate_sub(user_sub)
         data = MemoryCreate(content=content, memory_type=memory_type, tags=tags)
-        user = self.session.scalar(select(UserRecord).where(UserRecord.user_sub == user_sub))
-        if user is None:
-            user = UserRecord(user_sub=user_sub)
-            # A concurrent first request may have already created this profile.
-            try:
-                with self.session.begin_nested():
-                    self.session.add(user)
-                    self.session.flush()
-            except IntegrityError:
-                if (
-                    self.session.scalar(select(UserRecord).where(UserRecord.user_sub == user_sub))
-                    is None
-                ):
-                    raise
+        dialect = self.session.get_bind().dialect.name
+        if dialect == "sqlite":
+            insert = sqlite.insert
+        elif dialect == "postgresql":
+            insert = postgresql.insert
+        else:
+            raise RuntimeError("Profile creation is not supported on this database.")
+        self.session.execute(
+            insert(UserRecord)
+            .values(user_sub=user_sub)
+            .on_conflict_do_nothing(index_elements=[UserRecord.user_sub])
+        )
         record = MemoryRecord(
             user_sub=user_sub,
             content=data.content,
@@ -73,10 +79,11 @@ class MemoryService:
         self.session.add(record)
         self.session.commit()
         self.session.refresh(record)
-        return self._to_memory(record)
+        return self._to_memory(record, *self._timezone(user_sub))
 
     def get_memory(self, user_sub: str, memory_id: str) -> Memory:
-        return self._to_memory(self._get_record(user_sub, memory_id))
+        record = self._get_record(user_sub, memory_id)
+        return self._to_memory(record, *self._timezone(record.user_sub))
 
     def list_memories(
         self, user_sub: str, skip: int = 0, limit: int = 50, tags: list[str] | None = None
@@ -87,20 +94,22 @@ class MemoryService:
         statement = select(MemoryRecord).where(MemoryRecord.user_sub == user_sub)
         if tags is not None:
             tags = TypeAdapter(Tags).validate_python(tags)
+            if tags and self.session.get_bind().dialect.name != "sqlite":
+                raise UnsupportedFilterError
             for tag in dict.fromkeys(tags):
-                if self.session.get_bind().dialect.name == "sqlite":
-                    tag_values = func.json_each(MemoryRecord.tags).table_valued("value")
-                    statement = statement.where(
-                        exists(select(1).select_from(tag_values).where(tag_values.c.value == tag))
-                    )
-                else:
-                    raise ValueError("Tag filtering is currently supported only with SQLite")
-        records = self.session.scalars(
-            statement.order_by(MemoryRecord.created_at.desc(), MemoryRecord.id)
-            .offset(skip)
-            .limit(limit)
+                tag_values = func.json_each(MemoryRecord.tags).table_valued("value")
+                statement = statement.where(
+                    exists(select(1).select_from(tag_values).where(tag_values.c.value == tag))
+                )
+        records = list(
+            self.session.scalars(
+                statement.order_by(MemoryRecord.created_at.desc(), MemoryRecord.id)
+                .offset(skip)
+                .limit(limit)
+            )
         )
-        return [self._to_memory(record) for record in records]
+        timezone, zone = self._timezone(user_sub)
+        return [self._to_memory(record, timezone, zone) for record in records]
 
     def update_memory(self, user_sub: str, memory_id: str, **updates: Any) -> Memory:
         data = MemoryUpdate.model_validate(updates)
@@ -110,7 +119,7 @@ class MemoryService:
         record.updated_at = utc_now()
         self.session.commit()
         self.session.refresh(record)
-        return self._to_memory(record)
+        return self._to_memory(record, *self._timezone(record.user_sub))
 
     def delete_memory(self, user_sub: str, memory_id: str) -> bool:
         try:
