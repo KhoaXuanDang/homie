@@ -2,3 +2,6 @@
 .env
 .env.*
 !.env.example
+
+# Local agent plans
+/.agents/plans/**/*.md

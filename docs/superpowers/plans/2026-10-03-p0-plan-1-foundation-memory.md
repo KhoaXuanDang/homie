@@ -1,8 +1,10 @@
 # P0 Plan 1 — Foundation + Memory Implementation Plan
 
+Revised: 2026-10-10 — mobile-first Next.js PWA. This document plans implementation; its checkboxes remain unchecked.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the first end-to-end slice of homie: Cognito-authenticated Alexa+ MCP server with `remember` / `recall` / `forget`, a memory REST API, and a dashboard where a signed-in user views and edits their memories.
+**Goal:** Ship the first end-to-end slice of homie: Cognito-authenticated Alexa+ MCP server with `remember` / `recall` / `forget`, a memory REST API, and an installable mobile-first Next.js PWA where a signed-in user views and edits their memories. P0 is online-first with an offline fallback, with responsive desktop support.
 
 **Architecture:** One FastAPI app serves the MCP endpoint (official `mcp` v2 SDK, stateless Streamable HTTP, mounted at `/mcp`) and the `/api/*` REST routes; both call `app/services/memory.py`, which stores items in a single DynamoDB table keyed by the Cognito `sub`. Every request carries a Cognito access token verified against the pool's JWKS. The Next.js 16 dashboard signs in with Cognito Hosted UI + PKCE (`react-oidc-context`) and calls the REST API with typed `openapi-fetch` + TanStack Query.
 
@@ -10,7 +12,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-03-p0-design.md` (sections 2, 3, 4, 5, 6, 7, 8, 9, 11, 12 milestones 0–2).
 
-**Later plans (not this one):** Plan 2 Google (Calendar + Maps + settings), Plan 3 Media (S3) + Simulator (Bedrock), Plan 4 Deploy (EC2 + Caddy + Alexa registration + latency script).
+**Later plans (not this one):** Plan 2 Google (Calendar + Maps + profile/Google settings), Plan 3 Media (S3) + Simulator (Bedrock), Plan 4 Deploy (EC2 + Caddy + Alexa registration + latency script). Plan 1 now includes minimal account/installation Settings and stable HTTPS phone testing via a named tunnel; production deployment stays in Plan 4.
 
 ## Global Constraints
 
@@ -22,8 +24,12 @@
 - Memory `kind` ∈ `item_location | fact | preference | todo`; content 1–2000 chars after trim; ≤ 10 tags, each 1–40 chars, lowercased.
 - Rate limits per `sub`: MCP tools 60/min, other `/api/*` 120/min; in-memory sliding window.
 - List endpoints: `limit` default 50, max 200. `recall` returns ≤ 10.
+- Accepted small-scale P0 compromise: keep the current UI limit of 200 results and list/recall search window of the newest 2,000 memories, with no pagination or new creation limit; older memories may remain stored but unavailable through these views/searches, and resolving that limitation is deferred until the app needs to scale.
 - Python **3.14** (stdlib `uuid.uuid7`). Server config only via `app/config.py` `settings`; new env vars also go in `server/.env.example`.
-- Client: responsive from 375 px, tap targets ≥ 44 px, loading/empty/error state on every data view, confirm destructive actions (AGENTS.md checklist). Prettier style: no semicolons.
+- Client: mobile-first from 375 px, tap targets ≥ 44 px, safe-area and keyboard handling, loading/empty/error/connectivity states, confirm destructive actions (AGENTS.md checklist). Prettier style: no semicolons.
+- PWA: manifest/icons, standalone launch, installation help and generic offline fallback. App releases rely on normal user-initiated refreshes; no update prompts or release coordination. No offline writes, background sync, persistent private-data caches, web push, native wrapper or phone geolocation in P0.
+- Service-worker caching is allowlisted to the offline document and its public supporting assets only; it does not cache or manage app releases. Never cache private REST responses, authenticated HTML/RSC, OAuth callbacks, tokens or signed media URLs. User data stays in memory and is cleared on account changes.
+- Installed-app OAuth validation on real iOS/Android and a stable HTTPS origin is a foundation gate before Task 10. Browser login transfer into an installed app is not assumed.
 - Never commit `.env` files; branch + PR per milestone; stage explicit paths.
 
 ## Review Focus
@@ -32,7 +38,10 @@
 2. **Junk memory input** — whitespace-only content, 2001+ chars, 11 tags → REST 422 / MCP speakable error, never a 500 or a blank memory (tests in Tasks 5, 6, 7).
 3. **Vague recall** — "where is it?" (all stopwords/punctuation) must fall back to recent memories, not return nothing (test in Task 5).
 4. **Stale IDs** — PATCH/DELETE of an already-deleted memory or another user's memory returns 404 and never re-creates it (tests in Task 6); `forget` with a non-UUID id gives a speakable error (Task 7).
-5. **Expired dashboard session** — a 401 from the API sends the user back to sign-in instead of showing a dead error page (manual check in Task 11, code in Task 9).
+5. **Expired app session** — a 401 offers reauthentication instead of a dead error page or redirect loop; a dirty form is not silently discarded (Tasks 9, 10, 11).
+6. **Installed-app auth** — Cognito returns to a usable authenticated installed app with intact PKCE state; test logout, cold launch and resume (Task 9a).
+7. **Connectivity/privacy** — offline is not reported as empty data or a successful save; private responses are absent from worker caches, and another account never sees previous query data (Tasks 9a–11).
+8. **Phone usability/refreshes** — keyboard and home indicator do not cover navigation or Save; deployments do not force reloads, and normal refreshes load the new app after users finish/discard drafts (Tasks 9a–11).
 
 ---
 
@@ -46,6 +55,9 @@ infra/terraform/
   outputs.tf         (create) values for server/.env and client/.env.local
 docs/superpowers/spikes/
   2026-10-04-alexa-cognito-auth.md   (create) spike findings + decisions
+  mobile-pwa-auth.md               (create) installed-app auth results and tested device versions
+infra/caddy/dev.Caddyfile          (create) local same-origin reverse proxy behind named HTTPS tunnel
+docs/mobile-pwa-testing.md         (create) staging setup, device matrix, acceptance results
 server/
   pyproject.toml     (modify) python 3.14, deps, pytest config
   .python-version    (modify) 3.14
@@ -73,19 +85,39 @@ client/
   package.json       (modify) deps + gen:api + typecheck scripts
   src/lib/env.ts     (create)
   src/lib/api/schema.d.ts   (generated) OpenAPI types
-  src/lib/api/client.ts     (create) useApi() — typed fetch with bearer + 401 → sign-in
+  src/lib/api/client.ts     (create) useApi() — typed fetch with bearer + session-expired state
   src/lib/api/memories.ts   (create) TanStack Query hooks
   src/components/providers.tsx   (create) AuthProvider + QueryClientProvider + Toaster
   src/components/require-auth.tsx (create)
-  src/components/app-shell.tsx   (create) sidebar (md+) / bottom tabs (mobile)
+  src/components/app-shell.tsx   (create) safe-area mobile bottom tabs / desktop sidebar
+  src/components/pwa-controls.tsx (create) connectivity, install help, offline-fallback worker registration
+  src/components/session-expired.tsx (create) shared reauthentication notice with draft protection
   src/components/memories/kinds.ts, memory-card.tsx, memory-dialog.tsx (create)
-  src/app/layout.tsx (modify) Providers, metadata
+  src/app/layout.tsx (modify) Providers, metadata, viewport/safe-area configuration
+  src/app/manifest.ts (create) stable identity, standalone display, icons
+  src/app/apple-icon.png (create) Apple touch icon
+  public/icons/ (create) 192/512 and maskable icons
+  public/offline.html (create) generic offline fallback with retry
+  public/sw.js (create) navigation fallback and its public-asset cache lifecycle only
+  next.config.ts (modify) service-worker response headers; preserve standalone output
   src/app/page.tsx   (replace) sign-in landing
   src/app/auth/callback/page.tsx (create)
   src/app/(app)/layout.tsx       (create) RequireAuth + AppShell
   src/app/(app)/memories/page.tsx (create)
-AGENTS.md            (modify) python 3.14, env setup, gen:api
+  src/app/(app)/settings/page.tsx (create) account, installation help, sign-out
+AGENTS.md            (modify) python 3.14, env setup, gen:api; preserve mobile/PWA checklist
 ```
+
+## Commit checkpoints
+
+The commit commands below are implementation instructions, not authorization to commit unrelated working-tree changes.
+Before each group, inspect `git status --short` and the existing index; stage only that group's explicit file paths.
+Before every commit, run `git diff --cached --name-only` and `git diff --cached --check`, confirm at most 10 changed files
+are staged and that no real `.env` files or credentials are included (`.env.example` is allowed). Split a group further
+if generated components or supporting files take it over 10 files; list those actual filenames rather than staging an
+entire source directory. Preserve the pre-commit hook. Run checks for every package touched by the task before declaring
+the task complete, and ask before pushing. After a task's commits, inspect `git status --short` for omitted task files
+without sweeping unrelated files into a commit.
 
 ---
 
@@ -104,6 +136,8 @@ git checkout -b feat/p0-foundation-memory
 
 Run: `uv --version && bun --version && terraform version && aws sts get-caller-identity`
 Expected: versions print and `aws sts` shows the team AWS account (configure `AWS_PROFILE` if not). `uv` may live at `~/.local/bin/uv`.
+Also confirm `caddy version`, `cloudflared --version`, a team-owned stable tunnel hostname, and access to real iOS and
+Android test devices before Task 9. These are prerequisites for installed-app acceptance, not required to run backend unit tests.
 
 ---
 
@@ -368,18 +402,26 @@ curl -s -u "$ID:$SECRET" "$DOMAIN/oauth2/token" \
 
 Expected: JSON with `access_token`. Record: success or the exact error. Decode the token at a JWT debugger (or `cut -d. -f2 | base64 -d`) and record the `scope` claim string exactly (expected `homie/mcp:service`) and that `client_id` and `token_use` are present (`verify_token` requires both).
 
-- [ ] **Step 2: Does Alexa accept the prefixed scope names?**
+- [ ] **Step 2: Discover redirect URIs, create the linking client and configure scopes**
 
-Install the `alexa-ai` CLI per the [MCP Toolkit Quickstart prerequisites](https://developer.amazon.com/docs/alexaplus/add-ons/mcp-toolkit-quickstart.html), run `alexa-ai configure`, then `alexa-ai new mcp` in a scratch directory (outside the repo). In the generated `addon.json`, set the auth section to the Cognito values (authorization URL `$DOMAIN/oauth2/authorize`, token URL `$DOMAIN/oauth2/token`, client id/secret, scopes `homie/mcp:tools` and `homie/mcp:service`). Record: whether the CLI/console accepts `homie/mcp:tools`, and the **account-linking redirect URIs** it lists.
+1. Install the `alexa-ai` CLI per the [MCP Toolkit Quickstart prerequisites](https://developer.amazon.com/docs/alexaplus/add-ons/mcp-toolkit-quickstart.html), run `alexa-ai configure`, then `alexa-ai new mcp` in a scratch directory (outside the repo). Use Task 1's existing `alexa-service` credentials for service authentication and obtain the complete list of account-linking redirect URIs from the tooling/console.
+2. Set `alexa_redirect_uris` to that list in `infra/terraform/terraform.tfvars` (git-ignored), preserving any existing values for other variables. From the repo root, run `terraform -chdir=infra/terraform apply` to create Task 1's conditional `alexa-link` client before attempting account linking.
+3. Retrieve the resulting `alexa_link_client_id` and sensitive `alexa_link_client_secret` outputs and configure Alexa's account-linking settings with that client, `$DOMAIN/oauth2/authorize`, `$DOMAIN/oauth2/token` and `homie/mcp:tools`. Keep the separate `alexa-service` client and `homie/mcp:service` scope for service authentication. Keep credentials out of committed files and findings.
+4. Record the registered redirect URIs and whether the CLI/console accepts the prefixed scopes. Continue to Step 3's account-linking test only after the linking client exists and its credentials and callbacks are configured.
 
 - [ ] **Step 3: Throwaway MCP endpoint behind a tunnel**
 
-In the scratch directory create `spike.py`:
+In the scratch directory create `spike.py`. Fill the domain, issuer and app-client IDs from Task 1/Step 2's Terraform
+outputs before running it. The spike verifies Cognito access tokens; the presence of an Authorization header alone
+is not sufficient. For this throwaway spike only, retaining the existing diagnostic header logging is an accepted
+project compromise; production code still follows the repository's no-token/credential-logging rule.
 
 ```python
+import asyncio
 import json
 import logging
 
+import jwt
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
@@ -389,7 +431,41 @@ from starlette.routing import Mount, Route
 
 logging.basicConfig(level=logging.INFO)
 DOMAIN = "https://REPLACE-with-cognito_domain_url"
+ISSUER = "https://cognito-idp.REPLACE-region.amazonaws.com/REPLACE-pool-id"
+SERVICE_CLIENT_ID = "REPLACE-with-alexa_service_client_id"
+LINK_CLIENT_ID = "REPLACE-with-alexa_link_client_id"
+SERVICE_SCOPE = "homie/mcp:service"
+TOOLS_SCOPE = "homie/mcp:tools"
+jwks = jwt.PyJWKClient(f"{ISSUER}/.well-known/jwks.json", timeout=5)
 mcp = MCPServer("homie-spike")
+
+
+def verify_spike_token(authorization: bytes | None) -> bool:
+    scheme, _, token = (authorization or b"").decode("latin-1").partition(" ")
+    token = token.strip()
+    if scheme.lower() != "bearer" or not token:
+        return False
+    try:
+        claims = jwt.decode(
+            token,
+            jwks.get_signing_key_from_jwt(token).key,
+            algorithms=["RS256"],
+            issuer=ISSUER,
+            options={
+                "require": ["exp", "iss", "client_id", "token_use"],
+                "verify_aud": False,  # resource binding deferred for the hackathon
+            },
+        )
+    except jwt.PyJWTError:
+        return False
+    if claims["token_use"] != "access" or not isinstance(claims.get("scope"), str):
+        return False
+    scopes = set(claims["scope"].split())
+    if claims["client_id"] == SERVICE_CLIENT_ID:
+        return SERVICE_SCOPE in scopes
+    if claims["client_id"] == LINK_CLIENT_ID:
+        return TOOLS_SCOPE in scopes and isinstance(claims.get("sub"), str) and bool(claims["sub"])
+    return False
 
 
 @mcp.tool()
@@ -400,7 +476,7 @@ def ping_tool() -> str:
 
 async def metadata(_: Request) -> JSONResponse:
     return JSONResponse({
-        "issuer": DOMAIN,
+        "issuer": ISSUER,
         "authorization_endpoint": f"{DOMAIN}/oauth2/authorize",
         "token_endpoint": f"{DOMAIN}/oauth2/token",
         "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
@@ -421,9 +497,10 @@ async def log_everything(scope, receive, send):
         logging.info("%s %s headers=%s", scope["method"], scope["path"],
                      json.dumps({k.decode(): v.decode()[:40] for k, v in scope["headers"]}))
         auth = dict(scope["headers"]).get(b"authorization")
-        if scope["path"].startswith("/mcp") and not auth:
-            await Response(status_code=401)(scope, receive, send)
-            return
+        if scope["path"].startswith("/mcp"):
+            if not await asyncio.to_thread(verify_spike_token, auth):
+                await Response(status_code=401)(scope, receive, send)
+                return
     await app(scope, receive, send)
 
 
@@ -440,17 +517,27 @@ app = Starlette(
 Run (two terminals):
 
 ```bash
-uv run --with "mcp>=2.3" --with uvicorn uvicorn spike:log_everything --port 8000
+uv run --with "mcp>=2.3" --with "pyjwt[crypto]" --with uvicorn uvicorn spike:log_everything --port 8000
 cloudflared tunnel --url http://localhost:8000
 ```
 
-Point `addon.json`'s MCP endpoint at `https://<tunnel>/mcp`, `alexa-ai deploy`, link your account in the Alexa app, and ask Alexa to "use homie spike ping tool". Record from the log: which paths Alexa calls, the `mcp-protocol-version` header value, whether the service-token handshake hits `/mcp` and with which methods, and the round-trip latency Alexa reports.
+With Step 2's linking client and callbacks configured, point `addon.json`'s MCP endpoint at `https://<tunnel>/mcp`, run `alexa-ai deploy`, link your account in the Alexa app, and ask Alexa to "use homie spike ping tool". Record from the log: which paths Alexa calls, the `mcp-protocol-version` header value, whether the service-token handshake hits `/mcp` and with which methods, and the round-trip latency Alexa reports.
+
+Before treating the spike as authentication evidence, verify valid service and linked-user access tokens succeed,
+while missing/garbage tokens, invalid signatures, expired tokens, another pool's tokens, ID tokens, unknown clients
+and missing/wrong scopes are rejected with 401 and no `WWW-Authenticate` header. Exercise claim variants with locally
+signed test tokens and a test signing key/JWKS fixture, without weakening the live verifier. A linked-user token must
+also have a nonempty `sub`; failure to retrieve/validate a signing key must not admit the request. Record outcomes,
+not credentials, in the findings. Both token types can call this spike's non-personal `ping_tool`; this does not verify
+permission to read/write personal memories, which remains covered by Tasks 3 and 7.
 
 - [ ] **Step 4: Write findings and decide**
 
 Create `docs/superpowers/spikes/2026-10-04-alexa-cognito-auth.md` with sections: *Questions*, *Observations* (paste the recorded values from Steps 1–3), *Decision*. Decision is one of:
-- **Cognito-only (expected):** keep scopes `homie/mcp:tools` / `homie/mcp:service`; set `alexa_redirect_uris` in `infra/terraform/terraform.tfvars` (git-ignored) and re-run `terraform apply` to create the `alexa-link` client.
+- **Cognito-only (expected):** keep scopes `homie/mcp:tools` / `homie/mcp:service` and the `alexa-link` client created in Step 2; record the registration and account-linking results from Step 3.
 - **Fallback:** Cognito rejects `resource` or Alexa rejects prefixed scopes → add a Plan-1 follow-up task "FastAPI client_credentials token endpoint" (spec §4 fallback) before Plan 4.
+
+For the hackathon, we accept missing service-token `resource` validation as a known compromise and defer enforcing it until after the hackathon, unless it blocks Alexa integration, while retaining token signature, expiry, client, scope and user-isolation checks.
 
 - [ ] **Step 5: Commit findings only**
 
@@ -964,9 +1051,19 @@ Expected: all selected pass (11 auth cases + 3 limiter).
 
 - [ ] **Step 11: Lint and commit**
 
+Run from `server/`. Split the 12 intended files into runtime/configuration and auth/service commits; apply the commit
+checkpoints above to each group.
+
 ```bash
 uv run ruff check . && uv run ruff format .
-git add .python-version pyproject.toml uv.lock .env.example app/config.py app/auth.py app/ratelimit.py app/db.py tests/conftest.py tests/test_auth.py tests/test_ratelimit.py ../infra/docker/server.Dockerfile
+git add .python-version pyproject.toml uv.lock .env.example app/config.py ../infra/docker/server.Dockerfile
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "chore(server): configure Python 3.14 and foundation dependencies"
+
+git add app/auth.py app/ratelimit.py app/db.py tests/conftest.py tests/test_auth.py tests/test_ratelimit.py
+git diff --cached --name-only
+git diff --cached --check
 git commit -m "feat(server): add Cognito token verification and per-user rate limiting"
 ```
 
@@ -1061,7 +1158,7 @@ git commit -m "feat(server): serve OAuth authorization-server metadata for Alexa
 - Produces:
   - `app.models.memory.Kind = Literal["item_location", "fact", "preference", "todo"]`
   - `MemoryCreate(kind, content, tags=[], event_id=None)`, `MemoryUpdate(kind?, content?, tags?, event_id?)`, `Memory(MemoryCreate + id: UUID, media_ids: list[str], created_at: datetime, updated_at: datetime)`
-  - `app.services.memory.create_memory(sub, data: MemoryCreate) -> Memory`
+  - `app.services.memory.create_memory(sub, data: MemoryCreate, request_id: UUID | None = None) -> Memory` (Task 5 Step 4a adds idempotent creation when a request ID is supplied)
   - `list_memories(sub, kind: Kind | None = None, query: str | None = None, limit: int = 50) -> list[Memory]` (newest first; with `query`, only matches, best first)
   - `recall(sub, query: str, kind: Kind | None = None, limit: int = 10) -> list[Memory]` (falls back to newest when nothing matches)
   - `get_memory(sub, memory_id: UUID) -> Memory | None`
@@ -1353,10 +1450,48 @@ def delete_memory(sub: str, memory_id: UUID) -> bool:
     return "Attributes" in res
 ```
 
+- [ ] **Step 4a: Make app-created memories idempotent with two atomic records**
+
+Extend the service scaffold above before implementing the REST/client callers: accept an optional `request_id: UUID`
+and keep the existing server-generated UUIDv7 memory ID. The REST create flow requires a request ID; existing MCP
+calls without one retain their current behavior and do not gain retry deduplication from this change.
+
+Store these two items in the existing DynamoDB table (the example IDs are shortened):
+
+| `pk` | `sk` | Attributes |
+|---|---|---|
+| `USER#{sub}` | `MEM#123` | Existing memory fields; no change to the public `Memory` schema |
+| `USER#{sub}` | `REQUEST#create-memory#abc` | `memory_id: "123"`, `payload_hash`, UTC `created_at` |
+
+The request record is keyed by the authenticated user's `sub`, the operation and the request ID; never accept a user ID
+from the request body. Compute `payload_hash` as SHA-256 of a canonical JSON representation of the validated, normalized
+`MemoryCreate` fields, including defaults, so retries can be checked against the original submitted content.
+
+1. **Check before inserting:** strongly consistently read the request record for this user and request ID. If it exists,
+   compare the payload hash, then strongly consistently read and return its referenced memory. Different content with
+   the same request ID is a conflict (REST 409). If the referenced memory was deleted, return REST 410; never recreate it.
+2. **Insert both records atomically:** if the request record does not exist, generate the memory ID and use
+   `TransactWriteItems` to put the memory and request record together, with an `attribute_not_exists(pk)` condition on
+   each target item. Replace the standalone `put_item` path above for calls supplying a request ID; do not write the
+   records separately. DynamoDB must commit both items or neither.
+3. **Handle simultaneous retries:** the initial lookup alone is not a lock. If another attempt wins the conditional
+   request-record write, strongly consistently reread that record and follow step 1. An unresolved transaction conflict
+   or storage failure is a retryable failure with the same request ID, not permission to fall back to an unconditional
+   insertion. Do not misclassify every transaction cancellation as a successful duplicate.
+
+Retain request records without automatic expiry in P0, including after an individual memory is deleted; future
+delete-all-user-data work must remove them too. Keep them out of memory lists/recall via the existing `MEM#` prefix.
+No new table or index is needed. Expose service errors for payload conflict and a deleted referenced memory so routes
+can map them to HTTP responses while remaining thin.
+
+Add tests for same-user/same-ID replay returning one memory, different payload rejection, identical IDs belonging to
+different users, simultaneous attempts creating exactly one pair, transaction failure leaving neither record, and
+retry after memory deletion not recreating it.
+
 - [ ] **Step 5: Run tests**
 
 Run: `uv run pytest tests/test_memory_service.py -v`
-Expected: all pass (11 tests incl. 5 parametrized invalid inputs).
+Expected: all existing validation/CRUD tests and the Step 4a idempotency tests pass.
 
 - [ ] **Step 6: Commit**
 
@@ -1377,6 +1512,13 @@ git commit -m "feat(server): add DynamoDB memory service with keyword recall"
 **Interfaces:**
 - Consumes: `CurrentUser`, memory service functions, memory models.
 - Produces: `GET /api/memories?kind=&q=&limit=` → `list[Memory]`; `POST /api/memories` (201) → `Memory`; `PATCH /api/memories/{memory_id}` → `Memory` | 404; `DELETE /api/memories/{memory_id}` → 204 | 404. OpenAPI schema names `Memory`, `MemoryCreate`, `MemoryUpdate` (consumed by client typegen in Task 9).
+
+**Required create-contract extension to the scaffolds below:** `POST /api/memories` requires an `Idempotency-Key`
+header validated as a UUID with FastAPI `Header`, and passes it as `request_id` to Task 5 Step 4a's service. Keep the
+request ID out of `MemoryCreate`/`Memory`; expose the header in OpenAPI and document 409/410 responses. A replay returns
+the existing memory with the same 201 status. Missing/malformed keys return 422. Extend the tests below with a fresh key
+per logical creation (not one shared key in the reusable auth headers), and reuse that key only for retries. Test replay,
+409/410, header validation, and a committed create whose response is lost before a same-key retry.
 
 - [ ] **Step 1: Write the tests** — `server/tests/test_memories_api.py`
 
@@ -1786,7 +1928,10 @@ git commit -m "feat(server): add MCP endpoint with remember, recall and forget t
 
 - [ ] **Step 1: Add the typecheck script**
 
-Run: `cd client && npm pkg set scripts.typecheck="tsc --noEmit"`
+Run: `cd client && npm pkg set scripts.typecheck="next typegen && tsc --noEmit"`
+
+Generate Next.js route types before TypeScript checks references such as `LayoutProps`. Keep both commands in the
+`typecheck` script so local checks and CI work on a clean checkout without a prior `next dev` or `next build` run.
 
 - [ ] **Step 2: Create `.github/workflows/ci.yml`**
 
@@ -1845,6 +1990,8 @@ jobs:
 
 Run: `cd server && uv run ruff check . && uv run ruff format --check . && uv run pytest && cd ../client && bun run lint && bun run typecheck && bun run format:check && bun run build`
 Expected: all succeed.
+Also verify `bun run typecheck` after dependency installation on a clean checkout with no generated `.next` directory
+or `next-env.d.ts`; the script must generate the required types before running `tsc`.
 
 - [ ] **Step 4: Commit**
 
@@ -1861,10 +2008,24 @@ git commit -m "ci: run server, client and terraform checks on PRs"
 - Modify: `client/.gitignore`, `client/package.json`, `client/src/app/layout.tsx`, `server/.gitignore`
 - Create: `client/.env.example`, `server/scripts/export_openapi.py`, `client/src/lib/env.ts`, `client/src/lib/api/client.ts`, `client/src/lib/api/schema.d.ts` (generated), `client/src/components/providers.tsx`, `client/src/components/require-auth.tsx`, `client/src/components/app-shell.tsx`, `client/src/app/auth/callback/page.tsx`, `client/src/app/(app)/layout.tsx`
 - Replace: `client/src/app/page.tsx`
+- Create: `client/src/app/(app)/settings/page.tsx`, `client/src/components/session-expired.tsx`, `infra/caddy/dev.Caddyfile`, `docs/mobile-pwa-testing.md`
 
 **Interfaces:**
 - Consumes: OpenAPI from Task 6; Terraform outputs `cognito_issuer`, `dashboard_client_id`, `cognito_domain_url`, `mcp_tools_scope`.
-- Produces: `useApi()` → typed `openapi-fetch` client (`paths` from `schema.d.ts`) that adds the bearer token and redirects to sign-in on 401; `env` object; `<RequireAuth>`, `<AppShell>`; route group `(app)` for signed-in pages.
+- Produces: `useApi()` → typed `openapi-fetch` client (`paths` from `schema.d.ts`) that adds the bearer token and signals expired sessions on 401; `env` object; `<RequireAuth>`, `<AppShell>`; route group `(app)` for signed-in pages and minimal Settings.
+
+- [ ] **Step 0: Stable HTTPS phone-test origin**
+
+Use a team-owned stable named HTTPS tunnel forwarding to a local Caddy reverse proxy. Create
+`infra/caddy/dev.Caddyfile` with an HTTP listener on port 8080: route `/api/*`, `/mcp` and `/mcp/*`,
+`/.well-known/*`, and `/health` to `127.0.0.1:8000`; route everything else to `127.0.0.1:3000`.
+Run Caddy locally with this config and point the named tunnel at `http://localhost:8080`; TLS terminates at the tunnel.
+Record the chosen origin, launch commands and owner in `docs/mobile-pwa-testing.md`, without tunnel credentials.
+
+Add the exact origin to Task 1's `dashboard_urls` (which generates Cognito `/auth/callback` and logout URLs, and S3
+CORS); configure server CORS as needed. Never put a phone-facing `localhost` URL in the staging client build.
+For same-origin staging/production set `NEXT_PUBLIC_API_URL=` (empty); keep `http://localhost:8000` only for desktop
+local development. Confirm that generated `/api/*` paths are not prefixed twice. Production EC2/Caddy remains Plan 4.
 
 - [ ] **Step 1: Dependencies and shadcn components**
 
@@ -1890,14 +2051,18 @@ from app.main import app
 Path("openapi.json").write_text(json.dumps(app.openapi(), indent=2))
 ```
 
-Append `openapi.json` to `server/.gitignore`. Add the client script:
+Append `openapi.json` to `server/.gitignore`. From `client/`, add and run the generation script:
 
 ```bash
-npm pkg set scripts.gen:api="(cd ../server && uv run python scripts/export_openapi.py) && openapi-typescript ../server/openapi.json -o src/lib/api/schema.d.ts"
+npm pkg set scripts.gen:api="(cd ../server && uv run python -m scripts.export_openapi) && openapi-typescript ../server/openapi.json -o src/lib/api/schema.d.ts"
 bun run gen:api
 ```
 
-Expected: `src/lib/api/schema.d.ts` created containing `"/api/memories"` and `Memory`.
+Run the exporter as a module from `server/` so Python can resolve the sibling `app` package without custom `PYTHONPATH`
+settings. The subshell keeps the subsequent `openapi-typescript` command in `client/`.
+
+Expected on a clean checkout after dependency installation and the preceding implementation tasks:
+`src/lib/api/schema.d.ts` is created containing `"/api/memories"`, `Memory` and the required `Idempotency-Key` header.
 
 - [ ] **Step 3: Env files**
 
@@ -1907,6 +2072,7 @@ Create `client/.env.example`:
 
 ```dotenv
 NEXT_PUBLIC_API_URL=http://localhost:8000
+# For HTTPS staging/production behind the same-origin proxy, set NEXT_PUBLIC_API_URL= (empty).
 # terraform output cognito_issuer
 NEXT_PUBLIC_COGNITO_AUTHORITY=
 # terraform output dashboard_client_id
@@ -1945,13 +2111,9 @@ import { env } from "@/lib/env"
 
 import type { paths } from "./schema"
 
-// dev-note: one redirect per page load; concurrent 401s would otherwise each start one.
-let redirecting = false
-
 export function useApi() {
   const auth = useAuth()
   const token = auth.user?.access_token
-  const signIn = auth.signinRedirect
 
   return useMemo(() => {
     const client = createClient<paths>({ baseUrl: env.apiUrl })
@@ -1961,18 +2123,22 @@ export function useApi() {
         return request
       },
       onResponse({ response }) {
-        // Expired or revoked session: send the user back through sign-in.
-        if (response.status === 401 && !redirecting) {
-          redirecting = true
-          void signIn()
+        // A shared notice offers sign-in without discarding an open editor.
+        if (response.status === 401) {
+          window.dispatchEvent(new Event("homie:session-expired"))
         }
         return response
       },
     })
     return client
-  }, [token, signIn])
+  }, [token])
 }
 ```
+
+Implement `session-expired.tsx` inside the auth/query providers: coalesce these events into one notice, stop protected
+requests while expired, and offer a user-triggered sign-in action. Do not auto-redirect a dirty editor. Before redirecting,
+explain that the user must copy or discard their unsaved text; do not persist private drafts just to bridge OAuth.
+Reset the notice after a successful sign-in. Render plain-language errors and a retry action if sign-in fails.
 
 - [ ] **Step 5: Providers** — `client/src/components/providers.tsx`
 
@@ -2022,6 +2188,13 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
 If `bun run build` later fails prerendering with `window is not defined` / `localStorage is not defined`, wrap the export: in `layout.tsx` import `Providers` through a tiny client file using `next/dynamic(() => import("@/components/providers").then(m => m.Providers), { ssr: false })`.
 
+Extend the provider scaffold with the session-expired notice; Task 9a later mounts its PWA controls here. Scope query keys to
+`auth.user.profile.sub`, enable protected queries only for a valid signed-in session, cancel in-flight queries and clear
+the QueryClient on logout/account changes. Do not persist queries or mutations to localStorage/IndexedDB.
+Keep the auth library's token storage separate; installation may require a fresh sign-in. On resume, check session
+validity before refetching. Disable implicit offline mutation replay; connectivity checks and mutation failures must
+follow Task 9a's rules rather than silently pausing a write for later execution.
+
 - [ ] **Step 6: Root layout** — modify `client/src/app/layout.tsx`
 
 Change `metadata` to `{ title: "homie", description: "See and control what your Alexa remembers." }`, add `import { Providers } from "@/components/providers"`, and change the body to:
@@ -2031,6 +2204,8 @@ Change `metadata` to `{ title: "homie", description: "See and control what your 
   <Providers>{children}</Providers>
 </body>
 ```
+
+Task 9a adds manifest/icon metadata and the viewport configuration for safe areas; preserve browser zoom.
 
 - [ ] **Step 7: Landing + callback pages**
 
@@ -2104,71 +2279,46 @@ export default function AuthCallback() {
 
 - [ ] **Step 8: Auth guard** — `client/src/components/require-auth.tsx`
 
-```tsx
-"use client"
+Implement `RequireAuth` using the shared session state from Steps 4–5, distinguishing initial sign-in from recovery
+of an already authenticated session:
 
-import { useAuth } from "react-oidc-context"
+- **Initial visit:** show a loading skeleton while resolving authentication; if no valid session exists, show the
+  sign-in screen without mounting protected children.
+- **Session recovery:** once authenticated, keep the same editor subtree mounted during temporary auth loading,
+  token refresh or session expiry for that account; do not replace it merely because `auth.isLoading` becomes true
+  or `auth.isAuthenticated` becomes false. Preserve the draft and any pending save request ID/payload in browser React
+  state, disable protected requests and writes, and show the shared session-expired notice when reauthentication is
+  needed. Resume requests only after the same account has a valid session again.
+- **Full sign-in redirect:** require the user to copy or explicitly discard unsaved text before navigating away,
+  and warn before discarding an unresolved save; in-memory state does not survive a full redirect, reload or app
+  termination. Do not add Redis, persistent browser storage or another service for drafts.
+- **Explicit sign-out/account change:** clear drafts, pending save state and query data, and unmount the previous
+  account's protected subtree before showing another account. Keep this distinct from temporary session recovery;
+  the app's sign-out action must confirm discarding active work before clearing it.
 
-import { Button } from "@/components/ui/button"
-import { Skeleton } from "@/components/ui/skeleton"
-
-export function RequireAuth({ children }: { children: React.ReactNode }) {
-  const auth = useAuth()
-
-  if (auth.isLoading) {
-    return (
-      <div className="space-y-3 p-6" aria-busy="true">
-        <Skeleton className="h-8 w-48" />
-        <Skeleton className="h-24 w-full" />
-      </div>
-    )
-  }
-  if (!auth.isAuthenticated) {
-    return (
-      <main className="flex min-h-dvh flex-col items-center justify-center gap-4 p-6 text-center">
-        <p>
-          {auth.error
-            ? "Your session ended. Please sign in again."
-            : "Please sign in to see your homie data."}
-        </p>
-        <Button className="min-h-11" onClick={() => void auth.signinRedirect()}>
-          Sign in
-        </Button>
-      </main>
-    )
-  }
-  return children
-}
-```
+Verify with an open dirty editor that temporary auth loading and session expiry preserve its text and pending save
+state, protected requests stay disabled during recovery, same-account recovery keeps the draft, and a full redirect
+requires copy/discard confirmation; separately verify sign-out/account switching cannot restore the previous draft.
 
 - [ ] **Step 9: App shell** — `client/src/components/app-shell.tsx`
 
 ```tsx
 "use client"
 
-import { Brain, LogOut } from "lucide-react"
+import { Brain, Settings } from "lucide-react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { useAuth } from "react-oidc-context"
 
-import { env } from "@/lib/env"
 import { cn } from "@/lib/utils"
 
-// Plans 2–3 add Calendar, Media, Simulator and Settings here.
-const NAV = [{ href: "/memories", label: "Memories", icon: Brain }]
+// Later add Calendar and Media; Simulator is linked from Settings on mobile.
+const NAV = [
+  { href: "/memories", label: "Memories", icon: Brain },
+  { href: "/settings", label: "Settings", icon: Settings },
+]
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
-  const auth = useAuth()
-
-  async function signOut() {
-    await auth.removeUser()
-    const params = new URLSearchParams({
-      client_id: env.cognitoClientId,
-      logout_uri: window.location.origin,
-    })
-    window.location.href = `${env.cognitoDomain}/logout?${params}`
-  }
 
   const links = NAV.map(({ href, label, icon: Icon }) => {
     const active = pathname.startsWith(href)
@@ -2176,7 +2326,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   })
 
   return (
-    <div className="flex min-h-dvh">
+    <div className="flex min-h-dvh pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
       <aside className="hidden w-56 shrink-0 flex-col border-r md:flex">
         <div className="px-5 py-5 text-lg font-semibold">homie</div>
         <nav aria-label="Main" className="flex flex-col gap-1 px-2">
@@ -2197,20 +2347,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </Link>
           ))}
         </nav>
-        <button
-          onClick={signOut}
-          className="text-muted-foreground hover:bg-muted mx-2 mt-auto mb-4 flex min-h-11 items-center gap-3 rounded-md px-3 text-sm"
-        >
-          <LogOut className="size-4" aria-hidden />
-          Sign out
-        </button>
       </aside>
 
-      <main className="min-w-0 flex-1 pb-20 md:pb-0">{children}</main>
+      <main className="min-w-0 flex-1 pb-[calc(5rem+env(safe-area-inset-bottom))] md:pb-0">{children}</main>
 
       <nav
         aria-label="Main"
-        className="bg-background fixed inset-x-0 bottom-0 z-10 flex border-t md:hidden"
+        className="bg-background fixed inset-x-0 bottom-0 z-10 flex border-t pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] md:hidden"
       >
         {links.map(({ href, label, Icon, active }) => (
           <Link
@@ -2226,18 +2369,22 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             {label}
           </Link>
         ))}
-        <button
-          onClick={signOut}
-          className="text-muted-foreground flex min-h-14 flex-1 flex-col items-center justify-center gap-1 text-xs"
-        >
-          <LogOut className="size-5" aria-hidden />
-          Sign out
-        </button>
       </nav>
     </div>
   )
 }
 ```
+
+This shell is the starting layout. Verify it with the keyboard open on real devices: the editor must layer above the
+bottom tabs, remain scrollable and keep actions reachable. Use a viewport-height adjustment only if device testing
+shows it is needed; a desktop emulation screenshot does not establish keyboard behavior.
+
+Create `client/src/app/(app)/settings/page.tsx` as a client component using existing shadcn components. Show the current
+account and a ≥44 px sign-out button; Task 9a adds installation help. On sign-out cancel requests, clear the QueryClient,
+call `auth.removeUser()`, and navigate to `${env.cognitoDomain}/logout` with `client_id` and
+`logout_uri: window.location.origin` encoded via `URLSearchParams`. Surface a retryable error on failure. Confirm before
+discarding an active draft/upload. Do not show unavailable profile/Google controls or dead Simulator links; later plans
+extend this page. Keep Cognito's public app-client identifier named `dashboard` to avoid needless infrastructure changes.
 
 Create `client/src/app/(app)/layout.tsx`:
 
@@ -2265,14 +2412,135 @@ Expected: build succeeds (apply the Step 5 `ssr: false` fallback if prerender fa
 
 - [ ] **Step 11: Commit**
 
+Run the following groups from the repo root, applying the commit checkpoints to each. The first group includes shared
+configuration files the shadcn CLI may update; unchanged paths do not add files to the commit. Inspect generated changes
+for any additional dependencies/components and stage their exact paths in a suitable group of at most 10 changed files.
+If Step 5 required a separate client-only provider wrapper, add its explicit filename to the auth group (nine files below).
+
 ```bash
-git add client/.gitignore client/.env.example client/package.json client/bun.lock client/components.json client/src server/scripts/export_openapi.py server/.gitignore
-git commit -m "feat(client): add Cognito sign-in, typed API client and app shell"
+git add client/.gitignore client/.env.example client/package.json client/bun.lock client/components.json client/src/app/globals.css client/src/lib/utils.ts
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "chore(client): configure auth and UI dependencies"
+
+git add client/src/components/ui/input.tsx client/src/components/ui/textarea.tsx client/src/components/ui/label.tsx client/src/components/ui/badge.tsx client/src/components/ui/skeleton.tsx client/src/components/ui/tabs.tsx client/src/components/ui/dialog.tsx client/src/components/ui/alert-dialog.tsx client/src/components/ui/sonner.tsx
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "feat(client): add generated UI primitives"
+
+git add server/scripts/export_openapi.py server/.gitignore client/src/lib/env.ts client/src/lib/api/client.ts client/src/lib/api/schema.d.ts
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "feat(api): add OpenAPI export and typed client"
+
+git add client/src/components/providers.tsx client/src/components/require-auth.tsx client/src/components/app-shell.tsx client/src/components/session-expired.tsx client/src/app/layout.tsx client/src/app/page.tsx client/src/app/auth/callback/page.tsx 'client/src/app/(app)/layout.tsx' 'client/src/app/(app)/settings/page.tsx'
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "feat(client): add Cognito sign-in and app shell"
+
+git add infra/caddy/dev.Caddyfile docs/mobile-pwa-testing.md
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "chore(infra): document and configure HTTPS phone testing"
 ```
+
+The HTTPS origin's local Terraform variable changes and tunnel credentials remain uncommitted.
 
 ---
 
-### Task 10: `/memories` page
+### Task 9a: PWA foundation and installed-app auth validation
+
+**Depends on:** Task 9's auth shell and stable HTTPS staging origin. Complete before Task 10.
+
+**Files:**
+- Create: `client/src/app/manifest.ts`, `client/src/app/apple-icon.png`, `client/public/icons/`, `client/public/offline.html`, `client/public/sw.js`, `client/src/components/pwa-controls.tsx`, `docs/superpowers/spikes/mobile-pwa-auth.md`
+- Modify: `client/src/app/layout.tsx`, `client/src/components/providers.tsx`, `client/src/app/(app)/settings/page.tsx`, `client/next.config.ts`, `docs/mobile-pwa-testing.md`, `server/app/main.py`, `server/tests/test_memories_api.py`
+
+**Implementation references:** [Next.js PWA guide](https://nextjs.org/docs/app/guides/progressive-web-apps),
+[WebKit installed-app login storage](https://webkit.org/blog/14787/webkit-features-in-safari-17-2/).
+Check the installed Next.js 16 bundled docs before selecting APIs; do not copy newer experimental offline APIs into
+this version. Use built-in manifest support and a small worker for this limited scope; no PWA package is required.
+
+- [ ] **Step 1: Manifest, icons and viewport**
+
+Create a typed App Router manifest with stable `id: "/"`, `name: "homie"`, `short_name: "homie"`, `start_url: "/"`,
+`scope: "/"`, `display: "standalone"`, theme/background colors, 192×192 and 512×512 icons, and a maskable icon.
+Provide an Apple touch icon. Set appropriate theme and viewport metadata, including safe-area support, using the
+installed Next version's documented API. Keep zoom enabled. Confirm start URL redirects according to auth state.
+
+- [ ] **Step 2: Generic offline fallback and explicit cache boundaries**
+
+Create a self-contained `public/offline.html` with no user information, a connection explanation and a retry button.
+Register `public/sw.js` from the client only in production. Precache only the offline document and an explicit set of
+supporting assets needed by that document in a versioned `homie-public-*` cache. Do not cache the app shell or use broad runtime
+caching. Intercept same-origin top-level document navigations only, try the network first and serve the offline document
+only on network failure. Do not intercept API/MCP/auth/callback requests or RSC fetches; HTTP 401/403/500 responses must
+not be disguised as an offline success. Exclude `/auth/*`, `/api/*`, `/mcp` and `/mcp/*`, and `/.well-known/*` explicitly.
+
+Preserve `output: "standalone"` in `next.config.ts`; serve `/sw.js` as JavaScript with revalidation headers so an old
+worker is not held indefinitely. Add path-scoped response middleware in `app/main.py` setting `Cache-Control: no-store`
+on `/api/*` responses, including handled auth and validation errors; test successful, 401 and 422 memory responses.
+Later private endpoints inherit this contract. Never put tokens, callback URLs, private
+responses or signed S3 URLs in Cache Storage. Leave the auth library's token store separate and unchanged by the worker.
+
+- [ ] **Step 3: Connectivity and normal refresh behavior**
+
+Expose a shared connection state and an accessible status banner. Distinguish known offline, request failures, loading
+and empty results. Keep existing query data only in memory and label it potentially stale when disconnected. Disable
+writes while known offline, preserve drafts after failed requests, and require explicit retry after reconnect. Configure
+TanStack mutations to reject offline attempts rather than queue/replay them (verify `networkMode` behavior against the
+installed version); no mutation persistence or automatic mutation retries. Online indicators are advisory, so also handle
+timeouts/network failures. For an uncertain create, retry explicitly with the original request ID and submitted payload
+using Task 5 Step 4a's idempotency contract; a list refetch alone cannot establish which request created a memory.
+Reconcile uncertain updates/deletes with server state before retrying.
+Refetch reads after reconnect/resume only after confirming the session is valid.
+
+App releases take effect on normal user-initiated refreshes. Do not add release detection, an “Update available” prompt,
+a custom update/reload action or cross-tab update coordination. The worker serves the offline fallback only; retain its
+default activation lifecycle without `skipWaiting` or controller-change reload handlers. Version the fallback cache when
+its contents change and remove only old app-owned fallback caches after activation; do not tie worker changes to each
+app release. Deployments must not reload open editors or interrupt uploads. In-memory drafts and pending save keys do
+not survive a manual refresh, so users must finish or discard work first. If worker registration fails, keep the online
+application usable and offer retry.
+
+- [ ] **Step 4: Installation help**
+
+Add installation help to Settings, hidden in standalone mode. On browsers exposing an install event, offer an install
+action; otherwise explain the browser's Add to Home Screen action. Include iOS-specific instructions, handle dismissal
+without repeatedly prompting, and leave the browser experience usable. Web push and native packaging are not part of
+this task.
+
+- [ ] **Step 5: Installed-app auth spike**
+
+Build and serve the production client behind the stable HTTPS proxy. On real iOS Safari and Android Chrome, test both
+browser and installed modes: first sign-in, install after browser login, fresh login from the installed app, PKCE callback,
+logout, token expiry, cold launch, and background/resume. Browser-to-app login transfer is not required; a fresh sign-in
+is acceptable. Callback completion in the usable installed app and no redirect loop are required. Do not bridge contexts
+by putting tokens in URLs or worker messages. Record OS/browser versions and evidence in `mobile-pwa-auth.md`.
+If callback/state behavior fails, resolve it and revise the plan based on the observed failure before starting Task 10.
+
+- [ ] **Step 6: Verify fallback, privacy and normal refreshes**
+
+With production builds, verify an offline cold launch after one successful online load shows only the generic fallback;
+an offline auth callback may show the browser's network error but must not consume state or expose tokens. Inspect worker
+caches for only the offline document and its public supporting assets. Verify signed-out/account-changed views cannot
+reveal previous query data. Serve a second app build without changing the worker and verify a normal online refresh loads
+the new app, with no automatic reload of open pages. When fallback assets change, separately verify old fallback-cache
+cleanup after the worker activates through its default lifecycle. The dirty-editor check is completed in Task 11.
+Record results in `docs/mobile-pwa-testing.md`. Run server pytest/ruff and client lint/typecheck/build for the touched packages.
+
+- [ ] **Step 7: Commit when authorized by the working session**
+
+Stage only the explicit PWA, API-header, test and documentation paths. Split client, server and verification documentation
+into focused commits if this task changes more than 10 files; never stage `.env` files. Use Conventional Commits and
+retain the existing hook. A user instruction not to commit takes precedence over this step and all other commit steps.
+Apply the commit checkpoints to every group, counting each icon file separately. Include both
+`docs/mobile-pwa-testing.md` and `docs/superpowers/spikes/mobile-pwa-auth.md` in the verification documentation group;
+do not omit them because they were first introduced in another step.
+
+---
+
+### Task 10: Mobile `/memories` page and editor
 
 **Files:**
 - Create: `client/src/lib/api/memories.ts`, `client/src/components/memories/kinds.ts`, `client/src/components/memories/memory-card.tsx`, `client/src/components/memories/memory-dialog.tsx`, `client/src/app/(app)/memories/page.tsx`
@@ -2281,12 +2549,23 @@ git commit -m "feat(client): add Cognito sign-in, typed API client and app shell
 - Consumes: `useApi()`, generated `components["schemas"]["Memory" | "MemoryCreate" | "MemoryUpdate"]`.
 - Produces: hooks `useMemories(kind, q)`, `useCreateMemory()`, `useUpdateMemory()`, `useDeleteMemory()`; types `Memory`, `MemoryKind`.
 
+**Required create-contract extension to the hook/editor scaffolds below:** change the create mutation input to
+`{ requestId: string, body: MemoryCreate }` and send `requestId` in the generated API's `Idempotency-Key` header parameter.
+On the first Save, the editor generates a UUID with `crypto.randomUUID()` and retains it with a snapshot of the submitted
+body. Generate it in the editor's save-operation lifecycle, never inside the network function or on each retry. An explicit
+retry after an uncertain outcome reuses both values. Resolve the pending creation before submitting changed content;
+do not assign a fresh ID just because the previous response was lost. On confirmed success, clear the pending operation;
+a later new memory receives a new ID. Surface 409/410 without silently issuing a new create. Retain this state in memory
+only and warn before discarding an unresolved save; P0 does not guarantee retry deduplication after reload/app termination
+loses the key and has no persisted offline queue. Verify response-loss retry and rapid double submission create one memory.
+
 - [ ] **Step 1: Query hooks** — `client/src/lib/api/memories.ts`
 
 ```ts
 "use client"
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useAuth } from "react-oidc-context"
 
 import { useApi } from "./client"
 import type { components } from "./schema"
@@ -2300,11 +2579,15 @@ const KEY = ["memories"] as const
 
 export function useMemories(kind: MemoryKind | undefined, q: string) {
   const api = useApi()
+  const auth = useAuth()
+  const sub = auth.user?.profile.sub
   return useQuery({
-    queryKey: [...KEY, kind ?? "all", q],
-    queryFn: async () => {
+    queryKey: [...KEY, sub, kind ?? "all", q],
+    enabled: auth.isAuthenticated && Boolean(sub),
+    queryFn: async ({ signal }) => {
       const { data, error } = await api.GET("/api/memories", {
         params: { query: { kind, q: q || undefined, limit: 200 } },
+        signal,
       })
       if (error) throw new Error("Couldn't load memories")
       return data
@@ -2355,6 +2638,13 @@ export function useDeleteMemory() {
   })
 }
 ```
+
+Before continuing, integrate the hook scaffold above with Task 9a's shared session/connectivity state. Extend the query
+`enabled` condition to exclude expired sessions. Apply the same guard at every mutation boundary (including delete),
+set mutation `retry: false`, and select the installed TanStack version's network mode that executes the guard immediately
+instead of pausing/queuing writes. Disable write controls when offline or expired. Resolve uncertain creates through an
+explicit same-key/same-payload retry; reconcile uncertain updates/deletes with server state before retrying. This behavior
+is required even when the browser reports “online”.
 
 - [ ] **Step 2: Kind labels** — `client/src/components/memories/kinds.ts`
 
@@ -2481,7 +2771,15 @@ export function MemoryCard({
 }
 ```
 
-- [ ] **Step 4: Create/edit dialog** — `client/src/components/memories/memory-dialog.tsx`
+- [ ] **Step 4: Mobile full-screen editor / desktop dialog** — `client/src/components/memories/memory-dialog.tsx`
+
+Use the generated shadcn Dialog as the accessible primitive. On phones, make its content fill the available viewport,
+with safe-area padding and a scrollable form; on desktop retain a bounded dialog. Test against the real on-screen
+keyboard and adjust available height if needed so Save and close remain reachable. Keep ≥44 px controls and readable
+input text. The scaffold below shows form submission; completing this step also requires dirty-state tracking, confirmed
+discard on close/navigation and Task 9a's connectivity/session guards. App releases must not trigger reloads. Preserve
+all input after failures; clear it only after confirmed save or explicit discard. Mark both create and edit forms as busy
+to prevent double submission. Keep drafts in memory only; explain/copy/discard before a full OAuth redirect.
 
 ```tsx
 "use client"
@@ -2551,7 +2849,7 @@ export function MemoryDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent className="inset-0 h-dvh w-full max-w-none translate-x-0 translate-y-0 overflow-y-auto rounded-none pt-[max(1rem,env(safe-area-inset-top))] pr-[max(1rem,env(safe-area-inset-right))] pb-[max(1rem,env(safe-area-inset-bottom))] pl-[max(1rem,env(safe-area-inset-left))] sm:inset-auto sm:top-1/2 sm:left-1/2 sm:h-auto sm:max-h-[90dvh] sm:max-w-lg sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-lg sm:p-6">
         <DialogHeader>
           <DialogTitle>{memory ? "Edit memory" : "Add memory"}</DialogTitle>
         </DialogHeader>
@@ -2661,7 +2959,7 @@ export default function MemoriesPage() {
       <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
         <TabsList className="w-full justify-start overflow-x-auto">
           {KIND_TABS.map((t) => (
-            <TabsTrigger key={t.value} value={t.value}>
+            <TabsTrigger key={t.value} value={t.value} className="min-h-11 shrink-0">
               {t.label}
             </TabsTrigger>
           ))}
@@ -2714,10 +3012,19 @@ export default function MemoriesPage() {
 Run: `bun run lint && bun run typecheck && bun run format && bun run build`
 Expected: success. If a shadcn base-nova prop differs (e.g. `Tabs onValueChange` signature, `AlertDialogTrigger render`), align with the generated file in `src/components/ui/` and rerun.
 
+Verify filter controls fit a ≥44 px row with scrolling confined to that row (no page-level horizontal overflow); adjust
+the generated TabsList height rather than clipping taller triggers. Check long tags/content and large text on a 375 px
+screen. Add the connectivity banner and stale-data state to the page, and do not render a paused initial query as an
+endless skeleton. Check editor open/close, focus restoration and Save with the keyboard visible on both target phones.
+
 - [ ] **Step 7: Commit**
 
+Run from the repo root and apply the commit checkpoints.
+
 ```bash
-git add client/src/lib/api/memories.ts client/src/components/memories client/src/app/\(app\)/memories
+git add client/src/lib/api/memories.ts client/src/components/memories/kinds.ts client/src/components/memories/memory-card.tsx client/src/components/memories/memory-dialog.tsx 'client/src/app/(app)/memories/page.tsx'
+git diff --cached --name-only
+git diff --cached --check
 git commit -m "feat(client): add memories page with search, tabs, edit and delete"
 ```
 
@@ -2727,6 +3034,7 @@ git commit -m "feat(client): add memories page with search, tabs, edit and delet
 
 **Files:**
 - Modify: `AGENTS.md`
+- Update: `docs/mobile-pwa-testing.md`, `docs/superpowers/spikes/mobile-pwa-auth.md` with actual results, not assumed passes
 
 - [ ] **Step 1: Run the stack against the dev AWS stack**
 
@@ -2744,12 +3052,36 @@ cd client && bun dev
 2. Add "My passport is in the top desk drawer" (Item location, tag `travel`) → toast, appears in list.
 3. Search "passport" → shows it; search "bicycle" → "Nothing matches".
 4. Edit it → content updates; Delete → confirm dialog → removed.
-5. Browser devtools at 375 px width: no horizontal scroll, bottom tab bar visible, buttons ≥ 44 px, dialogs usable.
-6. **Expired session (Review Focus 5):** in devtools → Application → Local Storage, edit the `oidc.user:…` entry's `access_token` to `garbage`, then reload → API 401 → redirected to Cognito sign-in (not a blank error page).
+5. Browser devtools at 375 px width: no page-level horizontal scroll, bottom tab bar visible, controls ≥44 px, full-screen editor usable; desktop dialog/sidebar still work. This supplements the device matrix below.
+6. **Expired session (Review Focus 5):** expire/invalidate the test session and trigger an API call → one reauthentication notice, no redirect loop. Repeat with an unsaved editor: text remains and navigation happens only after explicit copy/discard. Complete sign-in and confirm requests recover. Never put real access tokens in test reports.
 7. Copy a fresh `access_token` from Local Storage → MCP Inspector (Task 7 Step 6) → call `remember` then `recall` → the memory shows up on `/memories` after refresh.
 8. With `cloudflared tunnel --url http://localhost:8000` and the spike's add-on config pointed at the tunnel: ask Alexa "remember my keys are on the hook", then "where are my keys?" → correct answer; the memory appears in the dashboard (same Cognito user).
 
+**Required mobile/PWA matrix:** serve a production build on Task 9's stable HTTPS origin. Run on real iOS Safari and
+Android Chrome, each in browser and installed modes; record OS/browser versions and pass/fail evidence in
+`docs/mobile-pwa-testing.md`. Desktop Chrome/Safari get navigation/auth/CRUD regression checks.
+
+| Scenario | Expected result |
+|---|---|
+| Install from browser, then launch from home screen | Correct icon/name, standalone shell and start URL; installation help hidden; fresh sign-in allowed |
+| Cognito login/logout, cold launch, background/resume, token expiry | Usable return to installed app, valid PKCE handling, no redirect loop; account visible in Settings |
+| Edit with keyboard open, portrait/landscape, text zoom | Content and ≥44 px actions remain reachable; safe areas respected; close/discard/focus behavior works |
+| Lose network on initial read or with data already loaded | Connection message instead of false empty state/endless spinner; existing in-memory data marked stale |
+| Cold launch offline after a successful online visit | Generic offline fallback only, no private memories; Retry recovers when online |
+| Save/delete when offline or request interrupted | No queued write, duplicate retry or false success; draft retained; ambiguous outcomes reconciled with server |
+| Reconnect/resume after Alexa updates a memory | Session checked and reads refreshed; current server data appears |
+| Sign out, then sign in as another test user | Query cache cleared; previous user's data never flashes or returns from worker caches |
+| Inspect Cache Storage and private API headers | Only allowlisted public assets/offline document cached; private responses use `no-store` |
+| Deploy second app build without changing the worker while an editor is dirty | Open pages stay mounted with drafts intact; after finishing/discarding work, a normal online refresh loads the new app; no update prompt or forced reload |
+
+If a device is unavailable or a check fails, record it as unverified/failed and leave acceptance incomplete. Later Google
+work must test OAuth return from installed mode; later media work must test library/camera selection, upload progress,
+foreground interruption and retry with a fresh presigned URL. Neither capability is implied by passing this first slice.
+
 - [ ] **Step 3: Update `AGENTS.md`**
+
+Preserve the mobile-first/PWA checklist already in `AGENTS.md`. Document the stable phone-test origin and production
+build workflow by linking `docs/mobile-pwa-testing.md`; keep credentials out of the docs.
 
 In the layout section change `Python 3.13` → `Python 3.14`. Add under **Commands**:
 
@@ -2767,6 +3099,8 @@ Add a section:
 3. `client/.env.local` from `client/.env.example`.
 4. Alexa testing: `cloudflared tunnel --url http://localhost:8000`, point the add-on at `<tunnel>/mcp`.
    See `docs/superpowers/spikes/2026-10-04-alexa-cognito-auth.md`.
+5. Phone/PWA testing: use the stable named HTTPS tunnel + local proxy described in `docs/mobile-pwa-testing.md`.
+   Build the client with same-origin API configuration and serve a production build; do not reuse desktop localhost API URLs.
 ```
 
 - [ ] **Step 4: Final checks and PR**
@@ -2774,10 +3108,20 @@ Add a section:
 Run: `cd server && uv run ruff check . && uv run pytest && cd ../client && bun run lint && bun run typecheck && bun run build`
 Expected: all green.
 
+Return to the repo root for these Git commands. Include Task 11's actual device/auth verification results along with
+the repository guidance; apply the commit checkpoints and inspect the remaining worktree for omitted task files.
+
 ```bash
-git add AGENTS.md
-git commit -m "docs: document local setup, Python 3.14 and API typegen"
+git add AGENTS.md docs/mobile-pwa-testing.md docs/superpowers/spikes/mobile-pwa-auth.md
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "docs(setup): record local setup and mobile acceptance results"
 git push -u origin feat/p0-foundation-memory   # ask before pushing
 gh pr create -B main -t "feat: P0 foundation + memory (Cognito auth, MCP memory tools, dashboard)" \
   -b "Implements Plan 1 (docs/superpowers/plans/2026-10-03-p0-plan-1-foundation-memory.md). Manual check results: <paste Step 2 results>"
 ```
+
+- [ ] **Final step after production deployment (Plan 4): Homepage QR code**
+
+Use a QR generator website to create a static QR code linking to homie's deployed HTTPS homepage. Scan it on a phone
+to verify the link before sharing it for the demo. This is a manual post-deployment task; no app implementation is needed.
