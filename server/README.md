@@ -8,6 +8,8 @@ Configuration is loaded from `server/.env` (see `.env.example`). `DATABASE_URL`
 defaults to `sqlite:///./homie.db`. Other synchronous SQLAlchemy database URLs
 require their corresponding driver; tag filtering currently requires SQLite
 and returns 400 on unsupported databases.
+Before starting Docker Compose from the repository root, create its required env
+file with `cp server/.env.example server/.env`.
 Docker Compose overrides `DATABASE_URL` to `sqlite:////data/homie.db` and stores
 memories and profiles in the persistent `homie-data` named volume. Rebuilding
 or recreating containers preserves this data; `docker compose down -v` deletes it.

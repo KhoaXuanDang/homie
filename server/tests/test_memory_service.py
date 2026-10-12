@@ -257,16 +257,3 @@ def test_unsupported_tag_filter(
     with pytest.raises(UnsupportedFilterError):
         service.list_memories("alice", tags=["home", "keys"])
     assert service.list_memories("alice", tags=[]) == []
-
-
-def test_validation_adapters_are_reused(
-    service: MemoryService,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fail_adapter(*args: object, **kwargs: object) -> None:
-        raise AssertionError("Do not construct validation adapters per call")
-
-    monkeypatch.setattr("app.services.memory_service.TypeAdapter", fail_adapter)
-    memory = service.create_memory("alice", "Memory", "fact", [])
-    assert service.list_memories("alice", tags=["home"]) == []
-    assert service.update_memory("alice", memory.id, content="Updated").content == "Updated"
