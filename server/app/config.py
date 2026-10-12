@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000"]
     database_url: str = "sqlite:///./homie.db"
     jwt_secret: str = ""
+    allow_mock_auth: bool = False
     google_maps_api_key: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""

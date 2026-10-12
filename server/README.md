@@ -6,7 +6,12 @@ The app creates missing tables at startup and closes database connections at shu
 
 Configuration is loaded from `server/.env` (see `.env.example`). `DATABASE_URL`
 defaults to `sqlite:///./homie.db`. Other synchronous SQLAlchemy database URLs
-require their corresponding driver; tag filtering currently requires SQLite.
+require their corresponding driver; tag filtering currently requires SQLite
+and returns 400 on unsupported databases.
+Docker Compose overrides `DATABASE_URL` to `sqlite:////data/homie.db` and stores
+memories and profiles in the persistent `homie-data` named volume. Rebuilding
+or recreating containers preserves this data; `docker compose down -v` deletes it.
+Existing local/container databases are not automatically copied into the volume.
 SQLite in-memory URLs share a connection across workers; request session lifetimes
 are serialized to prevent overlapping transactions on that connection.
 Schema changes to an existing database require migrations; automatic table creation
@@ -14,12 +19,14 @@ does not alter existing tables. Alembic and real Alexa authentication are deferr
 
 ## Development authentication
 
-With `JWT_SECRET` empty, send an `Authorization` header with scheme `Bearer`
+Authentication fails closed by default. For local development, explicitly set
+`ALLOW_MOCK_AUTH=true` with `JWT_SECRET` empty, then send an `Authorization` header with scheme `Bearer`
 and the desired user sub as the token. The token itself
 is treated as a mock Alexa `sub`; it is **not verified**. Use this only on a trusted
 local machine, never on a public deployment. Setting `JWT_SECRET` to a nonempty
 value disables mock authentication and returns 503 until real OAuth/JWT
 verification is implemented. It does not yet enable signed JWT authentication.
+Without the explicit mock opt-in, authenticated memory routes return 503.
 Memory routes are limited to 120 requests per user per minute in each process.
 
 ## Memory API

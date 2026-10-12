@@ -1,3 +1,5 @@
+import logging
+import traceback
 from asyncio import Lock
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -13,7 +15,9 @@ from app.config import settings
 from app.db import engine, init_db
 from app.middleware.auth import RateLimiter
 from app.routes import health, memories
-from app.services.memory_service import MemoryNotFoundError
+from app.services.memory_service import MemoryNotFoundError, UnsupportedFilterError
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -37,7 +41,19 @@ async def memory_not_found(request: Request, exc: MemoryNotFoundError) -> JSONRe
 
 @app.exception_handler(RequestValidationError)
 async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
-    return JSONResponse(status_code=422, content={"detail": "Invalid request fields."})
+    errors = [
+        {"loc": error["loc"], "msg": error["msg"], "type": error["type"]} for error in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422, content={"detail": "Invalid request fields.", "errors": errors}
+    )
+
+
+@app.exception_handler(UnsupportedFilterError)
+async def unsupported_filter(request: Request, exc: UnsupportedFilterError) -> JSONResponse:
+    return JSONResponse(
+        status_code=400, content={"detail": "Tag filtering is not supported on this database."}
+    )
 
 
 @app.middleware("http")
@@ -46,7 +62,13 @@ async def internal_error(
 ) -> Response:
     try:
         return await call_next(request)
-    except Exception:
+    except Exception as exc:
+        # Omit exception messages, local variables, and source lines which may contain secrets.
+        frames = "".join(
+            f'  File "{frame.f_code.co_filename}", line {line}, in {frame.f_code.co_name}\n'
+            for frame, line in traceback.walk_tb(exc.__traceback__)
+        )
+        logger.error("Unhandled %s\n%s", type(exc).__name__, frames)
         return JSONResponse(
             status_code=500, content={"detail": "Something went wrong. Please try again."}
         )
