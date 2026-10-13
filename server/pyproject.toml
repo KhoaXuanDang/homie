@@ -5,13 +5,14 @@ description = "Homie backend: FastAPI + MCP server for Alexa+"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "boto3>=1.43.112",
     "fastapi[standard]>=0.142.2",
     "pydantic-settings>=2.15.0",
-    "sqlalchemy==2.1.3",
 ]
 
 [dependency-groups]
 dev = [
+    "moto[dynamodb]>=5.2.4",
     "pytest>=9.1.1",
     "ruff>=0.16.10",
 ]

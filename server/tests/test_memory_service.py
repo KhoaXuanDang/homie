@@ -1,29 +1,25 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
-from pathlib import Path
 from threading import Barrier
-from unittest.mock import MagicMock
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from boto3.dynamodb.conditions import Key
+from moto import mock_aws
 from pydantic import ValidationError
-from sqlalchemy import event, func, select
-from sqlalchemy.dialects import postgresql
-from sqlalchemy.engine import Connection
-from sqlalchemy.orm import Session
 
-from app.db import create_db_engine
-from app.models.db import Base, MemoryRecord, UserRecord
-from app.models.user import Profile, User
-from app.services.memory_service import MemoryNotFoundError, MemoryService, UnsupportedFilterError
-
-
-@pytest.fixture
-def service(session: Session) -> MemoryService:
-    return MemoryService(session)
+from app.config import settings
+from app.models.user import Profile
+from app.services.memory_service import (
+    MemoryNotFoundError,
+    MemoryService,
+    ensure_table,
+    get_dynamodb_resource,
+)
 
 
-def test_crud(service: MemoryService, session: Session) -> None:
+def test_crud(service: MemoryService, ddb_table: Any) -> None:
     memory = service.create_memory("alice", "  Keys in drawer  ", "item_location", ["home", "home"])
     assert memory.content == "Keys in drawer"
     assert memory.tags == ["home"]
@@ -32,8 +28,9 @@ def test_crud(service: MemoryService, session: Session) -> None:
     assert memory.created_at.utcoffset().total_seconds() == 0
     assert service.get_memory("alice", memory.id) == memory
     assert service.list_memories("alice") == [memory]
-    user = session.scalar(select(UserRecord).where(UserRecord.user_sub == "alice"))
-    assert User.model_validate(user).timezone == "UTC"
+    user_item = ddb_table.get_item(Key={"pk": "USER#alice", "sk": "PROFILE"}).get("Item")
+    assert user_item is not None
+    assert Profile(timezone=user_item["timezone"]).timezone == "UTC"
     updated = service.update_memory("alice", memory.id, content="Keys in bag", tags=[])
     assert updated.content == "Keys in bag"
     assert updated.tags == []
@@ -163,18 +160,16 @@ def test_missing_ids_and_invalid_sub(service: MemoryService) -> None:
     [(datetime(2026, 1, 1, tzinfo=UTC), -18000), (datetime(2026, 7, 1, tzinfo=UTC), -14400)],
 )
 def test_profile_timezone_and_utc_storage(
-    service: MemoryService, session: Session, instant: datetime, offset: int
+    service: MemoryService, ddb_table: Any, instant: datetime, offset: int
 ) -> None:
-    session.add(UserRecord(user_sub="alice", timezone="America/New_York"))
-    session.commit()
+    ddb_table.put_item(Item={"pk": "USER#alice", "sk": "PROFILE", "timezone": "America/New_York"})
     memory = service.create_memory("alice", "Timezone", "fact", [])
-    record = session.get(MemoryRecord, memory.id)
-    record.created_at = instant.astimezone(ZoneInfo("Asia/Tokyo"))
-    session.commit()
-    session.expire_all()
-    stored = session.get(MemoryRecord, memory.id)
-    assert stored.created_at == instant
-    assert stored.created_at.utcoffset().total_seconds() == 0
+    tokyo_iso = instant.astimezone(ZoneInfo("Asia/Tokyo")).isoformat()
+    ddb_table.update_item(
+        Key={"pk": "USER#alice", "sk": f"MEM#{memory.id}"},
+        UpdateExpression="SET created_at = :cat",
+        ExpressionAttributeValues={":cat": tokyo_iso},
+    )
     result = service.get_memory("alice", memory.id)
     assert result.timezone == "America/New_York"
     assert result.created_at.utcoffset().total_seconds() == offset
@@ -186,103 +181,74 @@ def test_invalid_timezone() -> None:
         Profile(timezone="Not/AZone")
 
 
-def test_list_uses_one_profile_lookup(service: MemoryService, session: Session) -> None:
-    session.add(UserRecord(user_sub="alice", timezone="Asia/Tokyo"))
-    session.commit()
+def test_list_uses_one_profile_lookup(service: MemoryService, ddb_table: Any) -> None:
+    ddb_table.put_item(Item={"pk": "USER#alice", "sk": "PROFILE", "timezone": "Asia/Tokyo"})
     for i in range(5):
         service.create_memory("alice", f"Memory {i}", "fact", [])
-    statements: list[str] = []
 
-    def capture(
-        connection: Connection,
-        cursor: object,
-        statement: str,
-        parameters: object,
-        context: object,
-        executemany: bool,
-    ) -> None:
-        statements.append(statement)
+    original_get_item = service.table.get_item
+    profile_lookups = 0
 
-    event.listen(session.get_bind(), "before_cursor_execute", capture)
-    try:
-        memories = service.list_memories("alice")
-    finally:
-        event.remove(session.get_bind(), "before_cursor_execute", capture)
+    def spy_get_item(*args: Any, **kwargs: Any) -> Any:
+        nonlocal profile_lookups
+        key = kwargs.get("Key", {})
+        if key.get("sk") == "PROFILE":
+            profile_lookups += 1
+        return original_get_item(*args, **kwargs)
+
+    service.table.get_item = spy_get_item
+    memories = service.list_memories("alice")
     assert len(memories) == 5
-    assert len(statements) == 2
-    assert sum("FROM users" in statement for statement in statements) == 1
+    assert profile_lookups == 1
     assert all(memory.timezone == "Asia/Tokyo" for memory in memories)
     assert all(memory.created_at.utcoffset().total_seconds() == 32400 for memory in memories)
 
 
-def test_missing_profile_uses_utc(service: MemoryService, session: Session) -> None:
-    record = MemoryRecord(user_sub="orphan", content="Memory", memory_type="fact", tags=[])
-    session.add(record)
-    session.commit()
-    assert service.get_memory("orphan", record.id).timezone == "UTC"
+def test_missing_profile_uses_utc(service: MemoryService, ddb_table: Any) -> None:
+    memory_id = "orphan-123"
+    iso_now = datetime.now(UTC).isoformat()
+    ddb_table.put_item(
+        Item={
+            "pk": "USER#orphan",
+            "sk": f"MEM#{memory_id}",
+            "id": memory_id,
+            "user_sub": "orphan",
+            "content": "Memory",
+            "memory_type": "fact",
+            "kind": "fact",
+            "tags": [],
+            "created_at": iso_now,
+            "updated_at": iso_now,
+        }
+    )
+    assert service.get_memory("orphan", memory_id).timezone == "UTC"
     assert service.list_memories("orphan")[0].timezone == "UTC"
-    assert service.update_memory("orphan", record.id, content="Updated").timezone == "UTC"
+    assert service.update_memory("orphan", memory_id, content="Updated").timezone == "UTC"
 
 
-def test_failed_memory_insert_rolls_back_profile(
-    service: MemoryService,
-    session: Session,
-) -> None:
-    def fail_flush(session: Session, context: object, instances: object) -> None:
-        raise RuntimeError("Simulated memory insertion failure")
-
-    event.listen(session, "before_flush", fail_flush)
-    try:
-        with pytest.raises(RuntimeError, match="Simulated"):
-            service.create_memory("alice", "Memory", "fact", [])
-    finally:
-        session.rollback()
-        event.remove(session, "before_flush", fail_flush)
-    assert session.scalar(select(UserRecord).where(UserRecord.user_sub == "alice")) is None
-    assert service.list_memories("alice") == []
-
-
-def test_concurrent_first_memories_share_one_profile(tmp_path: Path) -> None:
-    engine = create_db_engine(f"sqlite:///{tmp_path / 'memories.db'}")
-    Base.metadata.create_all(engine)
+def test_concurrent_first_memories_share_one_profile(ddb_table: Any) -> None:
     barrier = Barrier(2)
 
     def create(content: str) -> str:
-        with Session(engine) as session:
-            barrier.wait(timeout=5)
-            return MemoryService(session).create_memory("alice", content, "fact", []).id
+        srv = MemoryService(table=ddb_table)
+        barrier.wait(timeout=5)
+        return srv.create_memory("alice", content, "fact", []).id
 
-    try:
-        with ThreadPoolExecutor(max_workers=2) as workers:
-            ids = list(workers.map(create, ["First", "Second"]))
-        assert len(set(ids)) == 2
-        with Session(engine) as session:
-            assert session.scalar(select(func.count()).select_from(UserRecord)) == 1
-            assert len(MemoryService(session).list_memories("alice")) == 2
-    finally:
-        engine.dispose()
-
-
-def test_postgres_profile_upsert() -> None:
-    session = MagicMock(spec=Session)
-    session.get_bind.return_value.dialect.name = "postgresql"
-    session.execute.side_effect = RuntimeError("Stop after upsert")
-    service = MemoryService(session)
-    with pytest.raises(RuntimeError, match="Stop after upsert"):
-        service.create_memory("alice", "Memory", "fact", [])
-    statement = session.execute.call_args.args[0]
-    sql = str(statement.compile(dialect=postgresql.dialect()))
-    assert "INSERT INTO users" in sql
-    assert "ON CONFLICT (user_sub) DO NOTHING" in sql
-    assert statement.compile().params["user_sub"] == "alice"
-    session.commit.assert_not_called()
-    session.begin_nested.assert_not_called()
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        ids = list(workers.map(create, ["First", "Second"]))
+    assert len(set(ids)) == 2
+    response = ddb_table.query(
+        KeyConditionExpression=Key("pk").eq("USER#alice") & Key("sk").eq("PROFILE")
+    )
+    assert len(response.get("Items", [])) == 1
+    assert len(MemoryService(table=ddb_table).list_memories("alice")) == 2
 
 
-def test_unsupported_tag_filter(
-    service: MemoryService, session: Session, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(session.get_bind().dialect, "name", "postgresql")
-    with pytest.raises(UnsupportedFilterError):
-        service.list_memories("alice", tags=["home", "keys"])
-    assert service.list_memories("alice", tags=[]) == []
+def test_ensure_table(isolated_env: None) -> None:
+    with mock_aws():
+        ensure_table()
+        ddb = get_dynamodb_resource()
+        table = ddb.Table(settings.dynamodb_table)
+        assert table.table_status == "ACTIVE"
+        # Calling ensure_table again handles existing table gracefully
+        ensure_table()

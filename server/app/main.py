@@ -1,6 +1,5 @@
 import logging
 import traceback
-from asyncio import Lock
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
@@ -8,26 +7,21 @@ from fastapi import FastAPI, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
 from app.config import settings
-from app.db import engine, init_db
 from app.middleware.auth import RateLimiter
 from app.routes import health, memories
-from app.services.memory_service import MemoryNotFoundError, UnsupportedFilterError
+from app.services.memory_service import MemoryNotFoundError, ensure_table
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    app.state.database_lock = Lock()
-    try:
-        await run_in_threadpool(init_db)
-        yield
-    finally:
-        await run_in_threadpool(engine.dispose)
+    if settings.dynamodb_endpoint_url:
+        ensure_table()
+    yield
 
 
 app = FastAPI(title="Homie API", lifespan=lifespan)
@@ -46,13 +40,6 @@ async def invalid_request(request: Request, exc: RequestValidationError) -> JSON
     ]
     return JSONResponse(
         status_code=422, content={"detail": "Invalid request fields.", "errors": errors}
-    )
-
-
-@app.exception_handler(UnsupportedFilterError)
-async def unsupported_filter(request: Request, exc: UnsupportedFilterError) -> JSONResponse:
-    return JSONResponse(
-        status_code=400, content={"detail": "Tag filtering is not supported on this database."}
     )
 
 
