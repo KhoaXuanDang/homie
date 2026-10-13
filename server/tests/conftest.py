@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from threading import local
 from typing import Any
 
 import boto3
@@ -6,6 +7,7 @@ import pytest
 from moto import mock_aws
 
 from app.config import settings
+from app.services import memory_service
 
 
 @pytest.fixture(autouse=True)
@@ -21,6 +23,7 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "aws_region", "us-east-1")
     monkeypatch.setattr(settings, "dynamodb_table", "homie-test")
     monkeypatch.setattr(settings, "dynamodb_endpoint_url", None)
+    monkeypatch.setattr(memory_service, "_thread", local())
 
 
 @pytest.fixture

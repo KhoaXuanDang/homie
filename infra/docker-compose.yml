@@ -1,7 +1,12 @@
 services:
   dynamodb:
-    image: amazon/dynamodb-local:latest
-    command: "-jar DynamoDBLocal.jar -sharedDb"
+    image: amazon/dynamodb-local:3.3.1
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath ./data"
+    # The image runs as uid 1000 but a new named volume is root-owned.
+    user: root
+    working_dir: /home/dynamodblocal
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
     ports: ["8001:8000"]
 
   server:
@@ -27,3 +32,5 @@ services:
     ports: ["3000:3000"]
     depends_on: [server]
 
+volumes:
+  dynamodb-data:
