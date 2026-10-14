@@ -1,23 +1,18 @@
 # Backend foundation
 
 From `server/`, run `uv sync`, then `uv run fastapi dev app/main.py`.
-The app creates missing tables at startup and closes database connections at shutdown.
 `GET /health` remains unauthenticated and returns `{"status": "ok"}`.
 
-Configuration is loaded from `server/.env` (see `.env.example`). `DATABASE_URL`
-defaults to `sqlite:///./homie.db`. Other synchronous SQLAlchemy database URLs
-require their corresponding driver; tag filtering currently requires SQLite
-and returns 400 on unsupported databases.
+Configuration is loaded from `server/.env` (see `.env.example`). Memories live in
+the DynamoDB table `DYNAMODB_TABLE` (keys `pk`/`sk`, see the P0 spec). When
+`DYNAMODB_ENDPOINT_URL` is set (DynamoDB Local), the app creates the table at
+startup, waiting for the endpoint to come up; against AWS the table comes from
+Terraform. Real Alexa authentication is deferred.
 Before starting Docker Compose from the repository root, create its required env
 file with `cp server/.env.example server/.env`.
-Docker Compose overrides `DATABASE_URL` to `sqlite:////data/homie.db` and stores
-memories and profiles in the persistent `homie-data` named volume. Rebuilding
-or recreating containers preserves this data; `docker compose down -v` deletes it.
-Existing local/container databases are not automatically copied into the volume.
-SQLite in-memory URLs share a connection across workers; request session lifetimes
-are serialized to prevent overlapping transactions on that connection.
-Schema changes to an existing database require migrations; automatic table creation
-does not alter existing tables. Alembic and real Alexa authentication are deferred.
+Docker Compose runs DynamoDB Local with its data in the `dynamodb-data` named
+volume, so rebuilding or recreating containers keeps memories;
+`docker compose down -v` deletes them.
 
 ## Development authentication
 
@@ -54,9 +49,9 @@ up to 50 characters each, trimmed and deduplicated, with case preserved.
 Repeated content creates separate memories with different IDs.
 List supports `0 <= skip <= 2**63 - 1`, `1 <= limit <= 100` (default 50), and repeated `tags`
 query parameters. All specified tags must match exactly, before pagination.
-Results are ordered newest first with an ID tie-breaker.
+Results are ordered newest first (IDs are UUIDv7, so key order is creation order).
 
-Profiles are created on first memory creation with timezone `UTC`. All database
+A user without a stored profile gets the default timezone `UTC`. All database
 timestamps are UTC; responses convert them using the stored profile's IANA
 timezone, including daylight-saving offsets. Profile editing is not exposed
 in this phase. Memory bodies cannot override the profile timezone.

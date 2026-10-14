@@ -1,13 +1,16 @@
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
+from functools import reduce
+from threading import local
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import boto3
-from boto3.dynamodb.conditions import Key
-from botocore.exceptions import ClientError
-from pydantic import TypeAdapter
+from boto3.dynamodb.conditions import Attr, Key
+from botocore.exceptions import ClientError, EndpointConnectionError
+from pydantic import TypeAdapter, ValidationError
 
 from app.config import settings
 from app.models.memory import Limit, Memory, MemoryCreate, MemoryUpdate, Skip, Tags
@@ -19,6 +22,8 @@ _user_sub_adapter = TypeAdapter(UserSub)
 _skip_adapter = TypeAdapter(Skip)
 _limit_adapter = TypeAdapter(Limit)
 _tags_adapter = TypeAdapter(Tags)
+# boto3 resources and the default session are not thread-safe; sync routes run in a threadpool.
+_thread = local()
 
 
 class MemoryNotFoundError(Exception):
@@ -29,46 +34,50 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def new_id() -> str:
-    if hasattr(uuid, "uuid7"):
-        return str(uuid.uuid7())
-    return str(uuid.uuid4())
-
-
 def get_dynamodb_resource() -> Any:
-    kwargs: dict[str, Any] = {"region_name": settings.aws_region}
-    if settings.dynamodb_endpoint_url:
-        kwargs["endpoint_url"] = settings.dynamodb_endpoint_url
-    return boto3.resource("dynamodb", **kwargs)
+    return boto3.session.Session().resource(
+        "dynamodb", region_name=settings.aws_region, endpoint_url=settings.dynamodb_endpoint_url
+    )
 
 
 def get_table() -> Any:
-    return get_dynamodb_resource().Table(settings.dynamodb_table)
+    if getattr(_thread, "table", None) is None:
+        _thread.table = get_dynamodb_resource().Table(settings.dynamodb_table)
+    return _thread.table
 
 
-def ensure_table() -> None:
+def ensure_table(attempts: int = 10, delay: float = 1.0) -> None:
     ddb = get_dynamodb_resource()
-    try:
-        ddb.create_table(
-            TableName=settings.dynamodb_table,
-            KeySchema=[
-                {"AttributeName": "pk", "KeyType": "HASH"},
-                {"AttributeName": "sk", "KeyType": "RANGE"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "pk", "AttributeType": "S"},
-                {"AttributeName": "sk", "AttributeType": "S"},
-            ],
-            BillingMode="PAY_PER_REQUEST",
-        )
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] not in (
-            "ResourceInUseException",
-            "TableAlreadyExistsException",
-        ):
-            logger.warning("Could not auto-create DynamoDB table: %s", exc)
-    except Exception as exc:
-        logger.warning("Could not auto-create DynamoDB table: %s", exc)
+    for attempt in range(attempts):
+        try:
+            ddb.create_table(
+                TableName=settings.dynamodb_table,
+                KeySchema=[
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"},
+                ],
+                AttributeDefinitions=[
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "S"},
+                ],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            return
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceInUseException":
+                return
+            raise
+        except EndpointConnectionError:
+            # DynamoDB Local may still be starting; fail startup loudly if it never comes up.
+            if attempt == attempts - 1:
+                raise
+            logger.warning("Waiting for DynamoDB at %s", settings.dynamodb_endpoint_url)
+            time.sleep(delay)
+
+
+def _parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class MemoryService:
@@ -79,42 +88,24 @@ class MemoryService:
         return _user_sub_adapter.validate_python(user_sub)
 
     def _timezone(self, user_sub: str) -> tuple[str, ZoneInfo]:
+        item = self.table.get_item(Key={"pk": f"USER#{user_sub}", "sk": "PROFILE"}).get("Item")
         try:
-            response = self.table.get_item(Key={"pk": f"USER#{user_sub}", "sk": "PROFILE"})
-            item = response.get("Item")
-            if item and "timezone" in item:
-                tz_name = Profile(timezone=item["timezone"]).timezone
-                return tz_name, ZoneInfo(tz_name)
-        except Exception:
-            pass
-        return "UTC", ZoneInfo("UTC")
+            tz_name = Profile(timezone=item["timezone"]).timezone if item else "UTC"
+        except KeyError, ValidationError:
+            logger.warning("Invalid stored profile timezone; using UTC")
+            tz_name = "UTC"
+        return tz_name, ZoneInfo(tz_name)
 
     @staticmethod
     def _to_memory(record: dict[str, Any], timezone: str, zone: ZoneInfo) -> Memory:
-        created_raw = record["created_at"]
-        if isinstance(created_raw, datetime):
-            created_dt = created_raw
-        else:
-            created_dt = datetime.fromisoformat(str(created_raw))
-        if created_dt.tzinfo is None:
-            created_dt = created_dt.replace(tzinfo=UTC)
-
-        updated_raw = record["updated_at"]
-        if isinstance(updated_raw, datetime):
-            updated_dt = updated_raw
-        else:
-            updated_dt = datetime.fromisoformat(str(updated_raw))
-        if updated_dt.tzinfo is None:
-            updated_dt = updated_dt.replace(tzinfo=UTC)
-
         return Memory(
             id=record["id"],
             user_sub=record["user_sub"],
             content=record["content"],
-            memory_type=record.get("memory_type") or record.get("kind", ""),
+            memory_type=record["kind"],
             tags=list(record.get("tags", [])),
-            created_at=created_dt.astimezone(zone),
-            updated_at=updated_dt.astimezone(zone),
+            created_at=_parse_utc(record["created_at"]).astimezone(zone),
+            updated_at=_parse_utc(record["updated_at"]).astimezone(zone),
             timezone=timezone,
         )
 
@@ -123,34 +114,17 @@ class MemoryService:
     ) -> Memory:
         user_sub = self._validate_sub(user_sub)
         data = MemoryCreate(content=content, memory_type=memory_type, tags=tags)
-
+        # A missing PROFILE means defaults (UTC); profiles are created by the profile endpoint.
+        memory_id = str(uuid.uuid7())
         now_iso = utc_now().isoformat()
-        try:
-            self.table.put_item(
-                Item={
-                    "pk": f"USER#{user_sub}",
-                    "sk": "PROFILE",
-                    "timezone": "UTC",
-                    "created_at": now_iso,
-                    "updated_at": now_iso,
-                },
-                ConditionExpression="attribute_not_exists(pk)",
-            )
-        except ClientError as exc:
-            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
-                raise
-
-        memory_id = new_id()
-        deduped_tags = list(dict.fromkeys(data.tags))
         item = {
             "pk": f"USER#{user_sub}",
             "sk": f"MEM#{memory_id}",
             "id": memory_id,
             "user_sub": user_sub,
             "content": data.content,
-            "memory_type": data.memory_type,
             "kind": data.memory_type,
-            "tags": deduped_tags,
+            "tags": list(dict.fromkeys(data.tags)),
             "created_at": now_iso,
             "updated_at": now_iso,
         }
@@ -177,30 +151,33 @@ class MemoryService:
         user_sub = self._validate_sub(user_sub)
         _skip_adapter.validate_python(skip)
         _limit_adapter.validate_python(limit)
-        validated_tags: list[str] | None = None
-        if tags is not None:
-            validated_tags = _tags_adapter.validate_python(tags)
+        unique_tags = list(dict.fromkeys(_tags_adapter.validate_python(tags or [])))
 
-        key_cond = Key("pk").eq(f"USER#{user_sub}") & Key("sk").begins_with("MEM#")
-        query_kwargs: dict[str, Any] = {"KeyConditionExpression": key_cond}
+        # UUIDv7 sort keys are time-ordered, so a descending query is newest-first.
+        query_kwargs: dict[str, Any] = {
+            "KeyConditionExpression": Key("pk").eq(f"USER#{user_sub}")
+            & Key("sk").begins_with("MEM#"),
+            "ScanIndexForward": False,
+        }
+        if unique_tags:
+            query_kwargs["FilterExpression"] = reduce(
+                lambda a, b: a & b, (Attr("tags").contains(tag) for tag in unique_tags)
+            )
+        # dev-note: offset paging reads skip+limit items; switch to a cursor if histories grow big.
+        wanted = skip + limit
         items: list[dict[str, Any]] = []
-        while True:
+        while len(items) < wanted:
+            # Limit counts items before the filter, so only cap pages when nothing is filtered.
+            if not unique_tags:
+                query_kwargs["Limit"] = wanted - len(items)
             response = self.table.query(**query_kwargs)
             items.extend(response.get("Items", []))
-            if "LastEvaluatedKey" not in response or len(items) >= 2000:
+            if "LastEvaluatedKey" not in response:
                 break
             query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
-        if validated_tags is not None:
-            unique_tags = list(dict.fromkeys(validated_tags))
-            if unique_tags:
-                req_tags_set = set(unique_tags)
-                items = [i for i in items if req_tags_set.issubset(set(i.get("tags", [])))]
-
-        items.sort(key=lambda x: (x.get("created_at", ""), x.get("id", "")), reverse=True)
-        sliced = items[skip : skip + limit]
         timezone, zone = self._timezone(user_sub)
-        return [self._to_memory(item, timezone, zone) for item in sliced]
+        return [self._to_memory(item, timezone, zone) for item in items[skip:wanted]]
 
     def update_memory(self, user_sub: str, memory_id: str, **updates: Any) -> Memory:
         user_sub = self._validate_sub(user_sub)
@@ -210,52 +187,40 @@ class MemoryService:
 
         changes = data.model_dump(exclude_unset=True)
         sets: dict[str, Any] = {}
-        for k, v in changes.items():
-            if k == "tags":
-                sets["tags"] = list(dict.fromkeys(v))
-            elif k == "memory_type":
-                sets["memory_type"] = v
-                sets["kind"] = v
-            else:
-                sets[k] = v
+        if "content" in changes:
+            sets["content"] = changes["content"]
+        if "memory_type" in changes:
+            sets["kind"] = changes["memory_type"]
+        if "tags" in changes:
+            sets["tags"] = list(dict.fromkeys(changes["tags"]))
         sets["updated_at"] = utc_now().isoformat()
-
-        update_expr = "SET " + ", ".join(f"#{k} = :{k}" for k in sets)
-        expr_attr_names = {f"#{k}": k for k in sets}
-        expr_attr_values = {f":{k}": v for k, v in sets.items()}
 
         try:
             response = self.table.update_item(
                 Key={"pk": f"USER#{user_sub}", "sk": f"MEM#{memory_id}"},
-                UpdateExpression=update_expr,
+                UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in sets),
                 ConditionExpression="attribute_exists(pk) AND attribute_exists(sk)",
-                ExpressionAttributeNames=expr_attr_names,
-                ExpressionAttributeValues=expr_attr_values,
+                ExpressionAttributeNames={f"#{k}": k for k in sets},
+                ExpressionAttributeValues={f":{k}": v for k, v in sets.items()},
                 ReturnValues="ALL_NEW",
             )
-            item = response["Attributes"]
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 raise MemoryNotFoundError("Memory not found") from exc
             raise
-        return self._to_memory(item, *self._timezone(user_sub))
+        return self._to_memory(response["Attributes"], *self._timezone(user_sub))
 
     def delete_memory(self, user_sub: str, memory_id: str) -> bool:
+        user_sub = self._validate_sub(user_sub)
         if not memory_id:
             return False
         try:
-            user_sub = self._validate_sub(user_sub)
-        except Exception:
-            return False
-
-        try:
-            response = self.table.delete_item(
+            self.table.delete_item(
                 Key={"pk": f"USER#{user_sub}", "sk": f"MEM#{memory_id}"},
                 ConditionExpression="attribute_exists(pk) AND attribute_exists(sk)",
-                ReturnValues="ALL_OLD",
             )
-            return "Attributes" in response
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return False
             raise
+        return True

@@ -5,12 +5,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
-from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError, EndpointConnectionError
 from moto import mock_aws
 from pydantic import ValidationError
 
 from app.config import settings
 from app.models.user import Profile
+from app.services import memory_service
 from app.services.memory_service import (
     MemoryNotFoundError,
     MemoryService,
@@ -28,9 +29,10 @@ def test_crud(service: MemoryService, ddb_table: Any) -> None:
     assert memory.created_at.utcoffset().total_seconds() == 0
     assert service.get_memory("alice", memory.id) == memory
     assert service.list_memories("alice") == [memory]
-    user_item = ddb_table.get_item(Key={"pk": "USER#alice", "sk": "PROFILE"}).get("Item")
-    assert user_item is not None
-    assert Profile(timezone=user_item["timezone"]).timezone == "UTC"
+    assert "Item" not in ddb_table.get_item(Key={"pk": "USER#alice", "sk": "PROFILE"})
+    stored = ddb_table.get_item(Key={"pk": "USER#alice", "sk": f"MEM#{memory.id}"})["Item"]
+    assert stored["kind"] == "item_location"
+    assert "memory_type" not in stored
     updated = service.update_memory("alice", memory.id, content="Keys in bag", tags=[])
     assert updated.content == "Keys in bag"
     assert updated.tags == []
@@ -214,7 +216,6 @@ def test_missing_profile_uses_utc(service: MemoryService, ddb_table: Any) -> Non
             "id": memory_id,
             "user_sub": "orphan",
             "content": "Memory",
-            "memory_type": "fact",
             "kind": "fact",
             "tags": [],
             "created_at": iso_now,
@@ -226,7 +227,7 @@ def test_missing_profile_uses_utc(service: MemoryService, ddb_table: Any) -> Non
     assert service.update_memory("orphan", memory_id, content="Updated").timezone == "UTC"
 
 
-def test_concurrent_first_memories_share_one_profile(ddb_table: Any) -> None:
+def test_concurrent_creates(ddb_table: Any) -> None:
     barrier = Barrier(2)
 
     def create(content: str) -> str:
@@ -237,10 +238,6 @@ def test_concurrent_first_memories_share_one_profile(ddb_table: Any) -> None:
     with ThreadPoolExecutor(max_workers=2) as workers:
         ids = list(workers.map(create, ["First", "Second"]))
     assert len(set(ids)) == 2
-    response = ddb_table.query(
-        KeyConditionExpression=Key("pk").eq("USER#alice") & Key("sk").eq("PROFILE")
-    )
-    assert len(response.get("Items", [])) == 1
     assert len(MemoryService(table=ddb_table).list_memories("alice")) == 2
 
 
@@ -252,3 +249,83 @@ def test_ensure_table(isolated_env: None) -> None:
         assert table.table_status == "ACTIVE"
         # Calling ensure_table again handles existing table gracefully
         ensure_table()
+
+
+def test_list_is_newest_first_and_reads_only_what_it_needs(
+    service: MemoryService, ddb_table: Any
+) -> None:
+    created = [service.create_memory("alice", f"M{i}", "fact", []) for i in range(30)]
+    limits: list[int] = []
+    original_query = service.table.query
+
+    def spy_query(**kwargs: Any) -> Any:
+        limits.append(kwargs.get("Limit"))
+        return original_query(**kwargs)
+
+    service.table.query = spy_query
+    page = service.list_memories("alice", skip=5, limit=10)
+    assert [m.id for m in page] == [m.id for m in reversed(created)][5:15]
+    assert limits == [15]
+
+
+def test_tag_filter_spans_query_pages(service: MemoryService, ddb_table: Any) -> None:
+    tagged = [service.create_memory("alice", f"T{i}", "fact", ["keys"]) for i in range(3)]
+    for i in range(20):
+        service.create_memory("alice", f"Other {i}", "fact", ["home"])
+    original_query = service.table.query
+    calls = 0
+
+    def small_pages(**kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original_query(**kwargs, Limit=5)
+
+    service.table.query = small_pages
+    result = service.list_memories("alice", tags=["keys"])
+    assert [m.id for m in result] == [m.id for m in reversed(tagged)]
+    assert calls > 1
+
+
+def test_invalid_stored_timezone_falls_back_to_utc(service: MemoryService, ddb_table: Any) -> None:
+    ddb_table.put_item(Item={"pk": "USER#alice", "sk": "PROFILE", "timezone": "Not/AZone"})
+    assert service.create_memory("alice", "Memory", "fact", []).timezone == "UTC"
+
+
+def test_profile_read_errors_are_not_swallowed(service: MemoryService) -> None:
+    memory = service.create_memory("alice", "Memory", "fact", [])
+    error = ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "GetItem")
+    original_get_item = service.table.get_item
+
+    def throttled_profile(**kwargs: Any) -> Any:
+        if kwargs["Key"]["sk"] == "PROFILE":
+            raise error
+        return original_get_item(**kwargs)
+
+    service.table.get_item = throttled_profile
+    with pytest.raises(ClientError):
+        service.get_memory("alice", memory.id)
+
+
+def test_ensure_table_waits_for_dynamodb(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    class FakeResource:
+        def create_table(self, **kwargs: Any) -> None:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise EndpointConnectionError(endpoint_url="http://dynamodb:8000")
+
+    monkeypatch.setattr(memory_service, "get_dynamodb_resource", FakeResource)
+    ensure_table(delay=0)
+    assert calls == 3
+    calls = -100
+    with pytest.raises(EndpointConnectionError):
+        ensure_table(attempts=2, delay=0)
+
+
+def test_table_is_cached_per_thread(ddb_table: Any) -> None:
+    first = memory_service.get_table()
+    assert memory_service.get_table() is first
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        assert worker.submit(memory_service.get_table).result() is not first

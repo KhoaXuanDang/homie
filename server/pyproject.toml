@@ -3,7 +3,7 @@ name = "server"
 version = "0.1.0"
 description = "Homie backend: FastAPI + MCP server for Alexa+"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "boto3>=1.43.112",
     "fastapi[standard]>=0.142.2",
