@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from app.config import settings
-from app.middleware.auth import RateLimiter
+from app.middleware.auth import McpAuthGate, RateLimiter
 from app.routes import health, memories
 from app.services.memory_service import MemoryNotFoundError, ensure_table
 
@@ -25,7 +25,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Homie API", lifespan=lifespan)
-app.state.rate_limiter = RateLimiter()
+app.state.api_rate_limiter = RateLimiter(max_requests=120)
+app.state.mcp_rate_limiter = RateLimiter(max_requests=60)
 
 
 @app.exception_handler(MemoryNotFoundError)
@@ -67,6 +68,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(McpAuthGate)
 
 app.include_router(health.router)
 app.include_router(memories.router)
