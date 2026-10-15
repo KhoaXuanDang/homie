@@ -3,12 +3,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 
-from app.middleware.auth import get_user_sub
-from app.models.memory import Kind, Limit, Memory, MemoryCreate, MemoryUpdate
+from app.middleware.auth import CurrentUserDependency
+from app.models.memory import Limit, Memory, MemoryCreate, MemoryUpdate, Skip, Tags
 from app.services.memory_service import MemoryService
 
-router = APIRouter(prefix="/api/memories", tags=["memories"])
-UserSubDependency = Annotated[str, Depends(get_user_sub)]
+router = APIRouter(prefix="/memories", tags=["memories"])
 
 
 def get_memory_service() -> MemoryService:
@@ -28,48 +27,43 @@ MemoryServiceDependency = Annotated[MemoryService, Depends(get_memory_service)]
     },
 )
 def create_memory(
-    data: MemoryCreate,
-    user_sub: UserSubDependency,
-    service: MemoryServiceDependency,
-    request_id: Annotated[UUID, Header(alias="Idempotency-Key")],
+    data: MemoryCreate, user: CurrentUserDependency, service: MemoryServiceDependency
 ) -> Memory:
-    return service.create_memory(
-        user_sub, data.content, data.kind, data.tags, data.event_id, request_id
-    )
+    return service.create_memory(user.sub, data.content, data.memory_type, data.tags)
 
 
 @router.get("", response_model=list[Memory])
 def list_memories(
-    user_sub: UserSubDependency,
+    user: CurrentUserDependency,
     service: MemoryServiceDependency,
     limit: Annotated[Limit, Query()] = 50,
     kind: Kind | None = None,
     q: Annotated[str | None, Query(max_length=200)] = None,
 ) -> list[Memory]:
-    return service.list_memories(user_sub, kind=kind, query=q, limit=limit)
+    return service.list_memories(user.sub, skip, limit, tags)
 
 
 @router.get("/{memory_id}", response_model=Memory)
 def get_memory(
-    memory_id: UUID, user_sub: UserSubDependency, service: MemoryServiceDependency
+    memory_id: str, user: CurrentUserDependency, service: MemoryServiceDependency
 ) -> Memory:
-    return service.get_memory(user_sub, str(memory_id))
+    return service.get_memory(user.sub, memory_id)
 
 
 @router.patch("/{memory_id}", response_model=Memory)
 def update_memory(
     memory_id: UUID,
     data: MemoryUpdate,
-    user_sub: UserSubDependency,
+    user: CurrentUserDependency,
     service: MemoryServiceDependency,
 ) -> Memory:
-    return service.update_memory(user_sub, str(memory_id), **data.model_dump(exclude_unset=True))
+    return service.update_memory(user.sub, memory_id, **data.model_dump(exclude_unset=True))
 
 
 @router.delete("/{memory_id}", status_code=204)
 def delete_memory(
-    memory_id: UUID, user_sub: UserSubDependency, service: MemoryServiceDependency
+    memory_id: str, user: CurrentUserDependency, service: MemoryServiceDependency
 ) -> Response:
-    if not service.delete_memory(user_sub, str(memory_id)):
+    if not service.delete_memory(user.sub, memory_id):
         raise HTTPException(404, "Memory not found")
     return Response(status_code=204)

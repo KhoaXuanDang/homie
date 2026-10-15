@@ -1,32 +1,59 @@
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
-from uuid import uuid4, uuid7
+from time import time
 
+import httpx
+import jwt
 import pytest
-from fastapi import HTTPException, Request
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import main
-from app.config import Settings, settings
-from app.middleware.auth import RateLimiter, get_user_sub
-from app.routes.memories import get_memory_service
-from app.services.memory_service import IdempotencyInProgressError, MemoryService
+from app.config import Settings
+from app.middleware import auth as auth_middleware
+from app.middleware.auth import RateLimiter, current_user
+from app.services.memory_service import MemoryService
+
+TEST_CLIENT_ID = "test-client"
+_test_signing_key: rsa.RSAPrivateKey | None = None
+_test_issuer = ""
 
 
-def auth(user_sub: str = "alice") -> dict[str, str]:
-    return {
-        "Authorization": " ".join(("Bearer", user_sub)),
-        "Idempotency-Key": str(uuid4()),
+def token(user_sub: str = "alice", **overrides: object) -> str:
+    now = int(time())
+    claims: dict[str, object] = {
+        "iss": _test_issuer,
+        "sub": user_sub,
+        "token_use": "access",
+        "client_id": TEST_CLIENT_ID,
+        "scope": "homie/mcp:tools homie/mcp:service",
+        "iat": now,
+        "exp": now + 300,
     }
+    claims.update(overrides)
+    if claims.get("sub") is None:
+        claims.pop("sub", None)
+    assert _test_signing_key is not None
+    return jwt.encode(claims, _test_signing_key, algorithm="RS256", headers={"kid": "test-key"})
+
+
+def auth(user_sub: str = "alice", **overrides: object) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token(user_sub, **overrides)}"}
 
 
 @pytest.fixture
-def client(ddb_table: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
-    monkeypatch.setattr(main.app.state, "rate_limiter", RateLimiter())
-    monkeypatch.setattr(settings, "jwt_secret", "")
-    monkeypatch.setattr(settings, "allow_mock_auth", True)
-    main.app.dependency_overrides[get_memory_service] = lambda: MemoryService(table=ddb_table)
+def client(
+    ddb_table: str,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_jwks_endpoint: str,
+    test_signing_key: rsa.RSAPrivateKey,
+) -> Iterator[TestClient]:
+    global _test_issuer, _test_signing_key
+    _test_issuer = fake_jwks_endpoint
+    _test_signing_key = test_signing_key
+    monkeypatch.setattr(main.app.state, "api_rate_limiter", RateLimiter(max_requests=120))
+    monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=60))
     with TestClient(main.app) as client:
         try:
             yield client
@@ -161,21 +188,161 @@ def test_auth_required(client: TestClient, method: str, path: str, data: dict | 
 
 @pytest.mark.parametrize("token", ["", "a b", "x" * 256])
 def test_invalid_tokens(client: TestClient, token: str) -> None:
-    assert client.get("/api/memories", headers=auth(token)).status_code == 401
+    response = client.get("/memories", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 401
+    assert "www-authenticate" not in response.headers
 
 
-def test_mock_auth_disabled(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "jwt_secret", "nonempty-test-value")
-    assert client.get("/api/memories", headers=auth()).status_code == 503
+def test_signature_must_match_the_cached_jwks(
+    client: TestClient, test_signing_key: rsa.RSAPrivateKey
+) -> None:
+    forged_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = int(time())
+    forged = jwt.encode(
+        {
+            "iss": _test_issuer,
+            "sub": "alice",
+            "token_use": "access",
+            "client_id": TEST_CLIENT_ID,
+            "scope": "homie/mcp:tools",
+            "iat": now,
+            "exp": now + 300,
+        },
+        forged_key,
+        algorithm="RS256",
+        headers={"kid": "test-key"},
+    )
+    valid = jwt.encode(
+        {
+            "iss": _test_issuer,
+            "sub": "alice",
+            "token_use": "access",
+            "client_id": TEST_CLIENT_ID,
+            "scope": "homie/mcp:tools",
+            "iat": now,
+            "exp": now + 300,
+        },
+        test_signing_key,
+        algorithm="RS256",
+        headers={"kid": "test-key"},
+    )
+    assert client.get("/memories", headers={"Authorization": f"Bearer {valid}"}).status_code == 200
+    response = client.get("/memories", headers={"Authorization": f"Bearer {forged}"})
+    assert response.status_code == 401
+    assert "www-authenticate" not in response.headers
+
+
+def test_missing_credentials_return_clean_401(client: TestClient) -> None:
+    for path in ("/memories", "/mcp"):
+        response = client.get(path)
+        assert response.status_code == 401
+        assert "www-authenticate" not in response.headers
+
+
+def test_legacy_mock_auth_environment_variable_is_inactive(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    response = client.get("/memories", headers={"Authorization": "Bearer alice"})
+    assert response.status_code == 401
+    assert "www-authenticate" not in response.headers
     assert client.get("/health").json() == {"status": "ok"}
 
 
-def test_mock_auth_requires_opt_in(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ALLOW_MOCK_AUTH", raising=False)
-    assert not Settings(_env_file=None).allow_mock_auth
-    monkeypatch.setattr(settings, "allow_mock_auth", False)
-    assert client.get("/api/memories", headers=auth()).status_code == 503
-    assert client.get("/health").status_code == 200
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"iss": "https://wrong.example/pool"},
+        {"token_use": "id"},
+        {"client_id": "not-allowed"},
+        {"scope": "homie/mcp:service"},
+        {"exp": int(time()) - 10},
+    ],
+)
+def test_invalid_cognito_claims_return_clean_401(
+    client: TestClient, overrides: dict[str, object]
+) -> None:
+    response = client.get("/memories", headers=auth("alice", **overrides))
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid or missing authentication token."}
+    assert "www-authenticate" not in response.headers
+
+
+def test_cognito_settings_defaults_and_client_id_list_parsing() -> None:
+    default_settings = Settings(_env_file=None)
+    assert default_settings.cognito_issuer == ""
+    assert default_settings.cognito_jwks_url == ""
+    assert default_settings.cognito_client_ids == []
+    parsed = Settings(_env_file=None, cognito_client_ids="client-a, client-b")
+    assert parsed.cognito_client_ids == ["client-a", "client-b"]
+
+
+def test_mcp_auth_gate_requires_service_scope_and_has_its_own_limiter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=1))
+    service_token = auth(scope="homie/mcp:service", sub=None)
+    response = client.get("/mcp", headers=service_token)
+    # Valid credentials pass the gate; the MCP route is not registered yet.
+    assert response.status_code == 404
+
+    limited = client.get("/mcp", headers=service_token)
+    assert limited.status_code == 429
+    assert limited.headers["Retry-After"] == "60"
+
+    # Linked-user tokens are also accepted and use their own user rate-limit partition.
+    tools_only = client.get("/mcp", headers=auth(scope="homie/mcp:tools"))
+    assert tools_only.status_code == 404
+    tools_limited = client.get("/mcp", headers=auth(scope="homie/mcp:tools"))
+    assert tools_limited.status_code == 429
+
+    # The separate API limiter remains unaffected by MCP requests.
+    assert client.get("/memories", headers=auth()).status_code == 200
+
+
+def test_mcp_gate_only_attaches_user_sub_for_linked_user_tokens(
+    client: TestClient,
+) -> None:
+    from starlette.requests import Request
+
+    async def probe_mcp(request: Request) -> dict[str, str | None]:
+        return {"user_sub": getattr(request.state, "user_sub", None)}
+
+    main.app.add_api_route("/mcp", probe_mcp, methods=["GET"], include_in_schema=False)
+    try:
+        service_response = client.get("/mcp", headers=auth(scope="homie/mcp:service", sub=None))
+        assert service_response.status_code == 200
+        assert service_response.json() == {"user_sub": None}
+
+        linked_user_response = client.get("/mcp", headers=auth(scope="homie/mcp:tools"))
+        assert linked_user_response.status_code == 200
+        assert linked_user_response.json() == {"user_sub": "alice"}
+    finally:
+        main.app.router.routes[:] = [
+            route
+            for route in main.app.router.routes
+            if getattr(route, "endpoint", None) is not probe_mcp
+        ]
+
+
+def test_jwks_refresh_http_error_uses_stale_cached_keys(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(auth_middleware, "_jwks_cache", {})
+    monkeypatch.setattr(auth_middleware, "_jwks_last_refresh_attempt", {})
+    now = [1000.0]
+    monkeypatch.setattr(auth_middleware, "monotonic", lambda: now[0])
+    jwks_url = auth_middleware.settings.cognito_jwks_url
+    cached_jwks = auth_middleware._load_jwks(jwks_url)
+
+    def fail_refresh(*args: object, **kwargs: object) -> None:
+        raise httpx.ConnectError("JWKS endpoint is unavailable")
+
+    monkeypatch.setattr(auth_middleware.httpx, "get", fail_refresh)
+    now[0] += auth_middleware.JWKS_CACHE_TTL_SECONDS + auth_middleware.JWKS_REFRESH_THROTTLE_SECONDS
+
+    assert auth_middleware._load_jwks(jwks_url) == cached_jwks
+    assert auth_middleware.verify_token(token(), "homie/mcp:tools").sub == "alice"
 
 
 @pytest.mark.parametrize("field", ["user_sub", "id", "timezone", "created_at", "updated_at"])
@@ -325,7 +492,7 @@ def test_rate_limiter_concurrent_access() -> None:
 def test_many_users_do_not_lock_out_new_users(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(main.app.state, "rate_limiter", RateLimiter(max_entries=5))
+    monkeypatch.setattr(main.app.state, "api_rate_limiter", RateLimiter(max_entries=5))
     for i in range(15):
         response = client.get("/api/memories", headers=auth(f"user_{i}"))
         assert response.status_code == 200
@@ -409,17 +576,16 @@ def test_validation_details_do_not_echo_values(
     assert "private" not in response.text
 
 
-def test_auth_attaches_request_state(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.middleware import auth as auth_module
+def test_current_user_dependency_attaches_authenticated_sub(client: TestClient) -> None:
+    from starlette.requests import Request
 
-    def check_state(request: Request) -> str:
-        credentials = auth_module.HTTPAuthorizationCredentials(scheme="Bearer", credentials="alice")
-        sub = get_user_sub(request, credentials)
-        assert request.state.user_sub == sub
-        return sub
-
-    main.app.dependency_overrides[get_user_sub] = check_state
-    try:
-        assert client.get("/api/memories", headers=auth()).status_code == 200
-    finally:
-        main.app.dependency_overrides.clear()
+    request = Request(
+        {
+            "type": "http",
+            "headers": [(b"authorization", auth("alice")["Authorization"].encode())],
+            "app": main.app,
+        }
+    )
+    user = current_user(request)
+    assert user.sub == "alice"
+    assert request.state.user_sub == "alice"

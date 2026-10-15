@@ -7,30 +7,32 @@ Configuration is loaded from `server/.env` (see `.env.example`). Memories live i
 the DynamoDB table `DYNAMODB_TABLE` (keys `pk`/`sk`, see the P0 spec). When
 `DYNAMODB_ENDPOINT_URL` is set (DynamoDB Local), the app creates the table at
 startup, waiting for the endpoint to come up; against AWS the table comes from
-Terraform. Real Alexa authentication is deferred.
+Terraform. Authentication uses Cognito access tokens signed by the configured
+user pool.
 Before starting Docker Compose from the repository root, create its required env
 file with `cp server/.env.example server/.env`.
 Docker Compose runs DynamoDB Local with its data in the `dynamodb-data` named
 volume, so rebuilding or recreating containers keeps memories;
 `docker compose down -v` deletes them.
 
-## Development authentication
+## Cognito authentication
 
-Authentication fails closed by default. For local development, explicitly set
-`ALLOW_MOCK_AUTH=true` with `JWT_SECRET` empty, then send an `Authorization` header with scheme `Bearer`
-and the desired user sub as the token. The token itself
-is treated as a mock Alexa `sub`; it is **not verified**. Use this only on a trusted
-local machine, never on a public deployment. Setting `JWT_SECRET` to a nonempty
-value disables mock authentication and returns 503 until real OAuth/JWT
-verification is implemented. It does not yet enable signed JWT authentication.
-Without the explicit mock opt-in, authenticated memory routes return 503.
-Memory routes are limited to 120 requests per user per minute in each process.
+Set `COGNITO_USER_POOL_ID` and the allowed `COGNITO_CLIENT_IDS` (a comma-separated
+list or JSON array) for the deployment. The API verifies RS256 signatures against
+the pool's cached JWKS, checks the issuer, access-token use, client ID, expiration,
+and required scope. Memory API requests require `MCP_TOOLS_SCOPE`; requests under
+`/mcp` require `MCP_SERVICE_SCOPE`. Invalid or missing credentials return 401.
+There is no mock-auth bypass. The sample pool and client IDs are development
+defaults only; configure your own values for deployed environments.
+
+Authenticated memory API requests are limited to 120 requests per user per minute
+and MCP requests to 60, per process.
 
 ## Memory API
 
 ```sh
-AUTH_HEADER="$(printf '%s %s' 'Bearer' 'alice')"
-curl -X POST http://127.0.0.1:8000/api/memories \
+AUTH_HEADER="$(printf '%s %s' 'Bearer' "$COGNITO_ACCESS_TOKEN")"
+curl -X POST http://127.0.0.1:8000/memories \
   -H "Authorization: $AUTH_HEADER" \
   -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
   -H 'Content-Type: application/json' \
