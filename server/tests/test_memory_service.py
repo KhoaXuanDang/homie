@@ -15,6 +15,7 @@ from app.models.user import Profile
 from app.services import memory_service
 from app.services.memory_service import (
     IdempotencyConflictError,
+    IdempotencyInProgressError,
     IdempotencyRecordDeletedError,
     MemoryNotFoundError,
     MemoryService,
@@ -70,6 +71,14 @@ def test_kind_query_and_limit_filtering(service: MemoryService) -> None:
     assert len(service.list_memories("alice", limit=2)) == 2
 
 
+@pytest.mark.parametrize("query", ["", " "])
+def test_blank_search_query_returns_unfiltered_memories(service: MemoryService, query: str) -> None:
+    older = service.create_memory("alice", "Older memory", "fact", [])
+    newer = service.create_memory("alice", "Newer memory", "todo", [])
+
+    assert service.list_memories("alice", query=query) == [newer, older]
+
+
 def test_recall_ranks_matches_and_falls_back_to_newest(service: MemoryService) -> None:
     older = service.create_memory("alice", "Passport is inside the desk drawer", "fact", [])
     newer = service.create_memory("alice", "Keys are hanging by the door", "item_location", [])
@@ -111,6 +120,11 @@ def test_idempotent_create_replays_and_rejects_changed_payload(service: MemorySe
         "alice", "  Passport drawer  ", "item_location", ["travel"], request_id=request_id
     )
     assert replay == created
+    updated = service.update_memory("alice", created.id, content="Edited after create")
+    latest_replay = service.create_memory(
+        "alice", "Passport drawer", "item_location", ["travel"], request_id=request_id
+    )
+    assert latest_replay == updated
     assert len(service.list_memories("alice")) == 1
     with pytest.raises(IdempotencyConflictError):
         service.create_memory("alice", "Different content", "fact", [], request_id=request_id)
@@ -152,6 +166,18 @@ def test_failed_idempotent_transaction_leaves_no_records(
         ).get("Item")
         is None
     )
+
+
+def test_cancelled_idempotent_transaction_without_record_is_retryable(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def cancel_transaction(**kwargs: Any) -> None:
+        raise ClientError({"Error": {"Code": "TransactionCanceledException"}}, "TransactWriteItems")
+
+    monkeypatch.setattr(service.table.meta.client, "transact_write_items", cancel_transaction)
+
+    with pytest.raises(IdempotencyInProgressError, match="Request in progress, try again"):
+        service.create_memory("alice", "In-flight create", "fact", [], request_id=uuid4())
 
 
 def test_concurrent_idempotent_creates_write_one_memory(ddb_table: Any) -> None:
@@ -295,7 +321,7 @@ def test_list_uses_one_profile_lookup(service: MemoryService, ddb_table: Any) ->
 
 
 def test_missing_profile_uses_utc(service: MemoryService, ddb_table: Any) -> None:
-    memory_id = "orphan-123"
+    memory_id = str(uuid4())
     iso_now = datetime.now(UTC).isoformat()
     ddb_table.put_item(
         Item={
@@ -351,7 +377,7 @@ def test_list_is_newest_first(service: MemoryService, ddb_table: Any) -> None:
     service.table.query = spy_query
     result = service.list_memories("alice", limit=10)
     assert [m.id for m in result] == [m.id for m in reversed(created)][:10]
-    assert limits == [2000]
+    assert limits == [10]
 
 
 def test_query_search_spans_dynamodb_pages(service: MemoryService, ddb_table: Any) -> None:
@@ -416,3 +442,22 @@ def test_table_is_cached_per_thread(ddb_table: Any) -> None:
     assert memory_service.get_table() is first
     with ThreadPoolExecutor(max_workers=1) as worker:
         assert worker.submit(memory_service.get_table).result() is not first
+
+
+def test_idempotency_uses_real_dynamodb_transaction(ddb_local_table: Any) -> None:
+    service = MemoryService(table=ddb_local_table)
+    request_id = uuid4()
+
+    created = service.create_memory(
+        "integration-user", "Spare key", "item_location", ["home"], request_id=request_id
+    )
+    replay = service.create_memory(
+        "integration-user", "Spare key", "item_location", ["home"], request_id=request_id
+    )
+
+    assert replay.id == created.id
+    assert len(service.list_memories("integration-user")) == 1
+    with pytest.raises(IdempotencyConflictError):
+        service.create_memory(
+            "integration-user", "Different payload", "fact", [], request_id=request_id
+        )

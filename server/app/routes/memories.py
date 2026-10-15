@@ -23,7 +23,7 @@ MemoryServiceDependency = Annotated[MemoryService, Depends(get_memory_service)]
     response_model=Memory,
     status_code=201,
     responses={
-        409: {"description": "Idempotency key reused with a different payload"},
+        409: {"description": "Idempotency conflict or request already in progress"},
         410: {"description": "Memory created by this request was deleted"},
     },
 )

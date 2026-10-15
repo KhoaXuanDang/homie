@@ -11,7 +11,7 @@ from app import main
 from app.config import Settings, settings
 from app.middleware.auth import RateLimiter, get_user_sub
 from app.routes.memories import get_memory_service
-from app.services.memory_service import MemoryService
+from app.services.memory_service import IdempotencyInProgressError, MemoryService
 
 
 def auth(user_sub: str = "alice") -> dict[str, str]:
@@ -92,6 +92,23 @@ def test_idempotency_conflict_and_deleted_memory_return_409_and_410(client: Test
     )
     assert gone.status_code == 410
     assert client.get("/api/memories", headers=auth()).json() == []
+
+
+def test_idempotency_transaction_in_progress_returns_retryable_409(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def in_progress(*args: Any, **kwargs: Any) -> None:
+        raise IdempotencyInProgressError("Request in progress, try again")
+
+    monkeypatch.setattr(MemoryService, "create_memory", in_progress)
+    response = client.post(
+        "/api/memories",
+        headers=auth(),
+        json={"content": "A fact", "kind": "fact"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Request in progress, try again"}
 
 
 @pytest.mark.parametrize("key", [None, "not-a-uuid"])
@@ -221,6 +238,21 @@ def test_api_kind_and_best_first_search(client: TestClient) -> None:
         "keys and passport are in the spare drawer",
         "keys are near the door",
     ]
+
+
+@pytest.mark.parametrize("query", ["q=", "q=%20"])
+def test_empty_query_parameter_returns_unfiltered_memories(client: TestClient, query: str) -> None:
+    created = client.post(
+        "/api/memories",
+        headers=auth(),
+        json={"content": "Keep this memory", "kind": "fact"},
+    )
+    assert created.status_code == 201
+
+    response = client.get(f"/api/memories?{query}", headers=auth())
+
+    assert response.status_code == 200
+    assert response.json() == [created.json()]
 
 
 def test_rate_limit(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

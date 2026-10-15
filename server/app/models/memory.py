@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Annotated, Literal, Self
+from uuid import UUID
 
 from pydantic import (
     AfterValidator,
@@ -57,7 +58,7 @@ class MemoryUpdate(BaseModel):
 class Memory(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: str
+    id: UUID
     user_sub: str
     content: str
     kind: Kind

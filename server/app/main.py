@@ -14,6 +14,7 @@ from app.middleware.auth import RateLimiter
 from app.routes import health, memories
 from app.services.memory_service import (
     IdempotencyConflictError,
+    IdempotencyInProgressError,
     IdempotencyRecordDeletedError,
     MemoryNotFoundError,
     ensure_table,
@@ -43,6 +44,13 @@ async def idempotency_conflict(request: Request, exc: IdempotencyConflictError) 
     return JSONResponse(
         status_code=409, content={"detail": "Idempotency key conflicts with an existing request."}
     )
+
+
+@app.exception_handler(IdempotencyInProgressError)
+async def idempotency_in_progress(
+    request: Request, exc: IdempotencyInProgressError
+) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": "Request in progress, try again"})
 
 
 @app.exception_handler(IdempotencyRecordDeletedError)

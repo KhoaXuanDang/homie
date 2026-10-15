@@ -1,11 +1,13 @@
 from collections.abc import Iterator
 from threading import Lock, local
 from typing import Any
+from uuid import uuid4
 
 import boto3
 import pytest
 from boto3.dynamodb.types import TypeDeserializer
-from botocore.exceptions import ClientError
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from moto import mock_aws
 
 from app.config import settings
@@ -71,6 +73,46 @@ def ddb_table(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
 
         monkeypatch.setattr(table.meta.client, "transact_write_items", transact_write_items)
         yield table
+
+
+@pytest.fixture
+def ddb_local_table() -> Iterator[Any]:
+    endpoint_url = "http://127.0.0.1:8001"
+    client = boto3.client(
+        "dynamodb",
+        region_name=settings.aws_region,
+        endpoint_url=endpoint_url,
+        config=Config(connect_timeout=1, read_timeout=1, retries={"max_attempts": 0}),
+    )
+    try:
+        client.list_tables()
+    except BotoCoreError as exc:
+        pytest.skip(f"DynamoDB Local is not running at {endpoint_url}: {exc}")
+
+    table_name = f"homie-integration-{uuid4().hex}"
+    try:
+        client.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table = boto3.resource(
+            "dynamodb", region_name=settings.aws_region, endpoint_url=endpoint_url
+        ).Table(table_name)
+        table.wait_until_exists()
+        yield table
+    finally:
+        try:
+            client.delete_table(TableName=table_name)
+        except ClientError:
+            pass
 
 
 @pytest.fixture

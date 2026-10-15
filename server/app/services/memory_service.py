@@ -4,9 +4,10 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from threading import local
-from typing import Any
+from typing import Any, TypeVar
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -26,6 +27,7 @@ _limit_adapter = TypeAdapter(Limit)
 _kind_adapter = TypeAdapter(Kind)
 _serializer = TypeSerializer()
 _MAX_ITEMS = 2000
+_Ranked = TypeVar("_Ranked")
 _STOPWORDS = frozenset(
     "a an and are at did do does for i in is it its me my of on or put the this to was "
     "were what when where which who why you your left keep kept".split()
@@ -39,6 +41,10 @@ class MemoryNotFoundError(Exception):
 
 
 class IdempotencyConflictError(Exception):
+    pass
+
+
+class IdempotencyInProgressError(Exception):
     pass
 
 
@@ -131,7 +137,7 @@ class MemoryService:
         self,
         user_sub: str,
         content: str,
-        kind: str,
+        kind: Kind,
         tags: list[str],
         event_id: str | None = None,
         request_id: uuid.UUID | str | None = None,
@@ -193,7 +199,7 @@ class MemoryService:
                         },
                     ]
                 )
-            except ClientError:
+            except ClientError as exc:
                 # Only treat a failed transaction as a replay if its request record now exists.
                 existing = self.table.get_item(
                     Key={"pk": request_item["pk"], "sk": request_sk}, ConsistentRead=True
@@ -202,6 +208,8 @@ class MemoryService:
                     return self._resolve_idempotent_replay(
                         user_sub, existing, request_item["payload_hash"]
                     )
+                if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+                    raise IdempotencyInProgressError("Request in progress, try again") from exc
                 raise
         else:
             self.table.put_item(Item=item)
@@ -224,6 +232,7 @@ class MemoryService:
         item = response.get("Item")
         if item is None:
             raise IdempotencyRecordDeletedError("The memory created by this request was deleted")
+        # P0 intentionally replays the memory's latest state, even if it changed after creation.
         return self._to_memory(item, *self._timezone(user_sub))
 
     @staticmethod
@@ -240,16 +249,31 @@ class MemoryService:
 
     @classmethod
     def _rank(cls, memories: list[Memory], query: str) -> list[Memory]:
+        return cls._rank_items(
+            memories,
+            query,
+            lambda memory: f"{memory.content} {' '.join(memory.tags)}",
+        )
+
+    @classmethod
+    def _rank_records(cls, records: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+        return cls._rank_items(
+            records,
+            query,
+            lambda record: f"{record['content']} {' '.join(record.get('tags', []))}",
+        )
+
+    @classmethod
+    def _rank_items(
+        cls, items: list[_Ranked], query: str, text: Callable[[_Ranked], str]
+    ) -> list[_Ranked]:
         query_tokens = cls._tokens(query)
         if not query_tokens:
             return []
-        scored = [
-            (len(query_tokens & cls._tokens(f"{memory.content} {' '.join(memory.tags)}")), memory)
-            for memory in memories
-        ]
+        scored = [(len(query_tokens & cls._tokens(text(item))), item) for item in items]
         return [
-            memory
-            for score, memory in sorted(scored, key=lambda item: item[0], reverse=True)
+            item
+            for score, item in sorted(scored, key=lambda entry: entry[0], reverse=True)
             if score
         ]
 
@@ -263,13 +287,26 @@ class MemoryService:
             raise MemoryNotFoundError("Memory not found")
         return self._to_memory(item, *self._timezone(user_sub))
 
-    def _read_memories(self, user_sub: str) -> list[Memory]:
+    def _read_memory_records(
+        self, user_sub: str, *, limit: int | None = None
+    ) -> list[dict[str, Any]]:
         # UUIDv7 sort keys are time-ordered, so a descending query is newest-first.
         query_kwargs: dict[str, Any] = {
             "KeyConditionExpression": Key("pk").eq(f"USER#{user_sub}")
             & Key("sk").begins_with("MEM#"),
             "ScanIndexForward": False,
         }
+        if limit is not None:
+            items: list[dict[str, Any]] = []
+            while len(items) < limit:
+                query_kwargs["Limit"] = limit - len(items)
+                response = self.table.query(**query_kwargs)
+                items.extend(response.get("Items", []))
+                if "LastEvaluatedKey" not in response:
+                    break
+                query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+            return items[:limit]
+
         items: list[dict[str, Any]] = []
         while len(items) < _MAX_ITEMS:
             query_kwargs["Limit"] = _MAX_ITEMS - len(items)
@@ -279,8 +316,13 @@ class MemoryService:
                 break
             query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
+        return items[:_MAX_ITEMS]
+
+    def _to_memories(self, user_sub: str, records: list[dict[str, Any]]) -> list[Memory]:
+        if not records:
+            return []
         timezone, zone = self._timezone(user_sub)
-        return [self._to_memory(item, timezone, zone) for item in items[:_MAX_ITEMS]]
+        return [self._to_memory(record, timezone, zone) for record in records]
 
     def list_memories(
         self,
@@ -288,27 +330,30 @@ class MemoryService:
         kind: Kind | None = None,
         query: str | None = None,
         limit: int = 50,
+        *,
+        _internal_limit: bool = False,
     ) -> list[Memory]:
         user_sub = self._validate_sub(user_sub)
-        _limit_adapter.validate_python(limit)
+        if not _internal_limit:
+            _limit_adapter.validate_python(limit)
         if kind is not None:
             _kind_adapter.validate_python(kind)
-        memories = self._read_memories(user_sub)
+        has_query = bool(query and query.strip())
+        records = self._read_memory_records(
+            user_sub,
+            limit=limit if kind is None and not has_query else None,
+        )
         if kind is not None:
-            memories = [memory for memory in memories if memory.kind == kind]
-        if query is not None:
-            memories = self._rank(memories, query)
-        return memories[:limit]
+            records = [record for record in records if record["kind"] == kind]
+        if query and query.strip():
+            records = self._rank_records(records, query.strip())
+        return self._to_memories(user_sub, records[:limit])
 
     def recall(
         self, user_sub: str, query: str, kind: Kind | None = None, limit: int = 10
     ) -> list[Memory]:
-        user_sub = self._validate_sub(user_sub)
         _limit_adapter.validate_python(limit)
-        memories = self._read_memories(user_sub)
-        if kind is not None:
-            _kind_adapter.validate_python(kind)
-            memories = [memory for memory in memories if memory.kind == kind]
+        memories = self.list_memories(user_sub, kind=kind, limit=_MAX_ITEMS, _internal_limit=True)
         return (self._rank(memories, query) or memories)[: min(limit, 10)]
 
     def update_memory(self, user_sub: str, memory_id: str, **updates: Any) -> Memory:
