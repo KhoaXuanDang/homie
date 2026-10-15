@@ -1,6 +1,8 @@
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from time import time
+from typing import Any
+from uuid import uuid4, uuid7
 
 import httpx
 import jwt
@@ -13,7 +15,8 @@ from app import main
 from app.config import Settings
 from app.middleware import auth as auth_middleware
 from app.middleware.auth import RateLimiter, current_user
-from app.services.memory_service import MemoryService
+from app.routes.memories import get_memory_service
+from app.services.memory_service import IdempotencyInProgressError, MemoryService
 
 TEST_CLIENT_ID = "test-client"
 _test_signing_key: rsa.RSAPrivateKey | None = None
@@ -39,7 +42,10 @@ def token(user_sub: str = "alice", **overrides: object) -> str:
 
 
 def auth(user_sub: str = "alice", **overrides: object) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token(user_sub, **overrides)}"}
+    return {
+        "Authorization": f"Bearer {token(user_sub, **overrides)}",
+        "Idempotency-Key": str(uuid4()),
+    }
 
 
 @pytest.fixture
@@ -54,6 +60,7 @@ def client(
     _test_signing_key = test_signing_key
     monkeypatch.setattr(main.app.state, "api_rate_limiter", RateLimiter(max_requests=120))
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=60))
+    main.app.dependency_overrides[get_memory_service] = lambda: MemoryService(table=ddb_table)
     with TestClient(main.app) as client:
         try:
             yield client
@@ -188,7 +195,7 @@ def test_auth_required(client: TestClient, method: str, path: str, data: dict | 
 
 @pytest.mark.parametrize("token", ["", "a b", "x" * 256])
 def test_invalid_tokens(client: TestClient, token: str) -> None:
-    response = client.get("/memories", headers={"Authorization": f"Bearer {token}"})
+    response = client.get("/api/memories", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 401
     assert "www-authenticate" not in response.headers
 
@@ -226,14 +233,16 @@ def test_signature_must_match_the_cached_jwks(
         algorithm="RS256",
         headers={"kid": "test-key"},
     )
-    assert client.get("/memories", headers={"Authorization": f"Bearer {valid}"}).status_code == 200
-    response = client.get("/memories", headers={"Authorization": f"Bearer {forged}"})
+    assert (
+        client.get("/api/memories", headers={"Authorization": f"Bearer {valid}"}).status_code == 200
+    )
+    response = client.get("/api/memories", headers={"Authorization": f"Bearer {forged}"})
     assert response.status_code == 401
     assert "www-authenticate" not in response.headers
 
 
 def test_missing_credentials_return_clean_401(client: TestClient) -> None:
-    for path in ("/memories", "/mcp"):
+    for path in ("/api/memories", "/mcp"):
         response = client.get(path)
         assert response.status_code == 401
         assert "www-authenticate" not in response.headers
@@ -243,7 +252,7 @@ def test_legacy_mock_auth_environment_variable_is_inactive(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
-    response = client.get("/memories", headers={"Authorization": "Bearer alice"})
+    response = client.get("/api/memories", headers={"Authorization": "Bearer alice"})
     assert response.status_code == 401
     assert "www-authenticate" not in response.headers
     assert client.get("/health").json() == {"status": "ok"}
@@ -262,7 +271,7 @@ def test_legacy_mock_auth_environment_variable_is_inactive(
 def test_invalid_cognito_claims_return_clean_401(
     client: TestClient, overrides: dict[str, object]
 ) -> None:
-    response = client.get("/memories", headers=auth("alice", **overrides))
+    response = client.get("/api/memories", headers=auth("alice", **overrides))
     assert response.status_code == 401
     assert response.json() == {"detail": "Invalid or missing authentication token."}
     assert "www-authenticate" not in response.headers
@@ -297,7 +306,7 @@ def test_mcp_auth_gate_requires_service_scope_and_has_its_own_limiter(
     assert tools_limited.status_code == 429
 
     # The separate API limiter remains unaffected by MCP requests.
-    assert client.get("/memories", headers=auth()).status_code == 200
+    assert client.get("/api/memories", headers=auth()).status_code == 200
 
 
 def test_mcp_gate_only_attaches_user_sub_for_linked_user_tokens(

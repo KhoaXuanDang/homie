@@ -1,13 +1,16 @@
 import json
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread, local
+from threading import Lock, Thread, local
 from typing import Any
 from uuid import uuid4
 
 import boto3
 import jwt
 import pytest
+from boto3.dynamodb.types import TypeDeserializer
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from cryptography.hazmat.primitives.asymmetric import rsa
 from moto import mock_aws
 
