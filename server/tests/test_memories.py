@@ -2,6 +2,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from time import time
 
+import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.config import Settings
+from app.middleware import auth as auth_middleware
 from app.middleware.auth import RateLimiter, current_user
 from app.services.memory_service import MemoryService
 
@@ -30,6 +32,8 @@ def token(user_sub: str = "alice", **overrides: object) -> str:
         "exp": now + 300,
     }
     claims.update(overrides)
+    if claims.get("sub") is None:
+        claims.pop("sub", None)
     assert _test_signing_key is not None
     return jwt.encode(claims, _test_signing_key, algorithm="RS256", headers={"kid": "test-key"})
 
@@ -199,13 +203,9 @@ def test_invalid_cognito_claims_return_clean_401(
 
 def test_cognito_settings_defaults_and_client_id_list_parsing() -> None:
     default_settings = Settings(_env_file=None)
-    assert default_settings.cognito_issuer == (
-        "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_QiV9mNe4W"
-    )
-    assert default_settings.cognito_jwks_url == (
-        "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_QiV9mNe4W/.well-known/jwks.json"
-    )
-    assert default_settings.cognito_client_ids == ["5nc9ipnu9f7s2de5tto3daag4b"]
+    assert default_settings.cognito_issuer == ""
+    assert default_settings.cognito_jwks_url == ""
+    assert default_settings.cognito_client_ids == []
     parsed = Settings(_env_file=None, cognito_client_ids="client-a, client-b")
     assert parsed.cognito_client_ids == ["client-a", "client-b"]
 
@@ -214,7 +214,7 @@ def test_mcp_auth_gate_requires_service_scope_and_has_its_own_limiter(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=1))
-    service_token = auth(scope="homie/mcp:service")
+    service_token = auth(scope="homie/mcp:service", sub=None)
     response = client.get("/mcp", headers=service_token)
     # Valid credentials pass the gate; the MCP route is not registered yet.
     assert response.status_code == 404
@@ -223,12 +223,59 @@ def test_mcp_auth_gate_requires_service_scope_and_has_its_own_limiter(
     assert limited.status_code == 429
     assert limited.headers["Retry-After"] == "60"
 
+    # Linked-user tokens are also accepted and use their own user rate-limit partition.
     tools_only = client.get("/mcp", headers=auth(scope="homie/mcp:tools"))
-    assert tools_only.status_code == 401
-    assert "www-authenticate" not in tools_only.headers
+    assert tools_only.status_code == 404
+    tools_limited = client.get("/mcp", headers=auth(scope="homie/mcp:tools"))
+    assert tools_limited.status_code == 429
 
     # The separate API limiter remains unaffected by MCP requests.
     assert client.get("/memories", headers=auth()).status_code == 200
+
+
+def test_mcp_gate_only_attaches_user_sub_for_linked_user_tokens(
+    client: TestClient,
+) -> None:
+    from starlette.requests import Request
+
+    async def probe_mcp(request: Request) -> dict[str, str | None]:
+        return {"user_sub": getattr(request.state, "user_sub", None)}
+
+    main.app.add_api_route("/mcp", probe_mcp, methods=["GET"], include_in_schema=False)
+    try:
+        service_response = client.get("/mcp", headers=auth(scope="homie/mcp:service", sub=None))
+        assert service_response.status_code == 200
+        assert service_response.json() == {"user_sub": None}
+
+        linked_user_response = client.get("/mcp", headers=auth(scope="homie/mcp:tools"))
+        assert linked_user_response.status_code == 200
+        assert linked_user_response.json() == {"user_sub": "alice"}
+    finally:
+        main.app.router.routes[:] = [
+            route
+            for route in main.app.router.routes
+            if getattr(route, "endpoint", None) is not probe_mcp
+        ]
+
+
+def test_jwks_refresh_http_error_uses_stale_cached_keys(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(auth_middleware, "_jwks_cache", {})
+    monkeypatch.setattr(auth_middleware, "_jwks_last_refresh_attempt", {})
+    now = [1000.0]
+    monkeypatch.setattr(auth_middleware, "monotonic", lambda: now[0])
+    jwks_url = auth_middleware.settings.cognito_jwks_url
+    cached_jwks = auth_middleware._load_jwks(jwks_url)
+
+    def fail_refresh(*args: object, **kwargs: object) -> None:
+        raise httpx.ConnectError("JWKS endpoint is unavailable")
+
+    monkeypatch.setattr(auth_middleware.httpx, "get", fail_refresh)
+    now[0] += auth_middleware.JWKS_CACHE_TTL_SECONDS + auth_middleware.JWKS_REFRESH_THROTTLE_SECONDS
+
+    assert auth_middleware._load_jwks(jwks_url) == cached_jwks
+    assert auth_middleware.verify_token(token(), "homie/mcp:tools").sub == "alice"
 
 
 @pytest.mark.parametrize("field", ["user_sub", "id", "timezone", "created_at", "updated_at"])

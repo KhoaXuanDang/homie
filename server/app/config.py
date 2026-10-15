@@ -12,9 +12,9 @@ class Settings(BaseSettings):
     dynamodb_table: str = "homie-dev"
     dynamodb_endpoint_url: str | None = None
     cors_origins: list[str] = ["http://localhost:3000"]
-    cognito_user_pool_id: str = "us-east-1_QiV9mNe4W"
+    cognito_user_pool_id: str = ""
     cognito_domain: str = ""
-    cognito_client_ids: Annotated[list[str], NoDecode] = ["5nc9ipnu9f7s2de5tto3daag4b"]
+    cognito_client_ids: Annotated[list[str], NoDecode] = []
     public_base_url: str = "http://localhost:8000"
     mcp_tools_scope: str = "homie/mcp:tools"
     mcp_service_scope: str = "homie/mcp:service"
@@ -35,12 +35,15 @@ class Settings(BaseSettings):
 
     @property
     def cognito_issuer(self) -> str:
+        if not self.cognito_user_pool_id:
+            return ""
         region = self.cognito_user_pool_id.split("_", maxsplit=1)[0] or self.aws_region
         return f"https://cognito-idp.{region}.amazonaws.com/{self.cognito_user_pool_id}"
 
     @property
     def cognito_jwks_url(self) -> str:
-        return f"{self.cognito_issuer}/.well-known/jwks.json"
+        issuer = self.cognito_issuer
+        return f"{issuer}/.well-known/jwks.json" if issuer else ""
 
 
 settings = Settings()
