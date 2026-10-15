@@ -8,6 +8,7 @@ dependencies = [
     "boto3>=1.43.112",
     "fastapi[standard]>=0.142.2",
     "pydantic-settings>=2.15.0",
+    "pyjwt[crypto]>=2.10.1",
 ]
 
 [dependency-groups]
