@@ -1,75 +1,104 @@
 "use client"
 
 import { useQueryClient } from "@tanstack/react-query"
-import { createContext, use, useMemo, useSyncExternalStore } from "react"
+import { WebStorageStateStore } from "oidc-client-ts"
+import { useRouter } from "next/navigation"
+import { createContext, use, useMemo } from "react"
+import {
+  AuthProvider as OidcProvider,
+  useAuth as useOidc,
+} from "react-oidc-context"
 
 export type User = { sub: string; name: string; email: string }
-type Session = { user: User; accessToken: string | null }
+type Session = { user: User; accessToken: string }
 
 type Auth = {
-  /** True until the client has read the stored session (SSR/first paint). */
+  /** True until the stored session is read or a sign-in redirect finishes. */
   loading: boolean
   session: Session | null
-  signIn: (input: { email: string; password: string }) => Promise<void>
-  signUp: (input: {
-    name: string
-    email: string
-    password: string
-  }) => Promise<void>
-  signOut: () => void
+  /** Plain-language message when the last sign-in attempt failed. */
+  error: string | null
+  /** Sends the user to Cognito's Hosted UI (sign-in and sign-up). */
+  signIn: () => Promise<void>
+  signOut: () => Promise<void>
 }
 
-const AuthContext = createContext<Auth | null>(null)
-
-// dev-note: stub auth. Sign-in/sign-up aren't wired to Cognito yet (needs the
-// dashboard client to allow USER_PASSWORD_AUTH + SignUp). In `next dev` a
-// token-less demo session lets you click through the UI; every API call still
-// needs a real token, so the server rejects it. Production builds throw.
-const KEY = "homie:dev-session"
-const EVENT = "homie:auth"
-const isDev = process.env.NODE_ENV === "development"
-
-function subscribe(onChange: () => void) {
-  window.addEventListener(EVENT, onChange)
-  return () => window.removeEventListener(EVENT, onChange)
-}
-
-function write(session: Session | null) {
-  if (session) sessionStorage.setItem(KEY, JSON.stringify(session))
-  else sessionStorage.removeItem(KEY)
-  window.dispatchEvent(new Event(EVENT))
-}
-
-async function startDevSession(name: string, email: string) {
-  if (!isDev) throw new Error("Email sign-in isn't available yet.")
-  write({ user: { sub: `dev:${email}`, name, email }, accessToken: null })
-}
+// Cognito Hosted UI with authorization code + PKCE (plan Task 9). NEXT_PUBLIC_*
+// must be referenced literally so Next inlines them at build time.
+const AUTHORITY = process.env.NEXT_PUBLIC_COGNITO_AUTHORITY ?? ""
+const CLIENT_ID = process.env.NEXT_PUBLIC_COGNITO_CLIENT_ID ?? ""
+const DOMAIN = process.env.NEXT_PUBLIC_COGNITO_DOMAIN ?? ""
+const SCOPE =
+  process.env.NEXT_PUBLIC_COGNITO_SCOPE ??
+  "openid email profile homie/mcp:tools"
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const queryClient = useQueryClient()
-  const raw = useSyncExternalStore(
-    subscribe,
-    () => (isDev ? (sessionStorage.getItem(KEY) ?? "") : ""),
-    () => null,
+  const router = useRouter()
+  // react-oidc-context skips the UserManager during SSR; only touch window in the browser.
+  const isBrowser = typeof window !== "undefined"
+
+  return (
+    <OidcProvider
+      authority={AUTHORITY}
+      client_id={CLIENT_ID}
+      redirect_uri={isBrowser ? `${window.location.origin}/auth/callback` : ""}
+      scope={SCOPE}
+      // localStorage so an installed PWA survives cold launches.
+      userStore={
+        isBrowser
+          ? new WebStorageStateStore({ store: window.localStorage })
+          : undefined
+      }
+      onSigninCallback={() => router.replace("/memories")}
+    >
+      <SessionBridge>{children}</SessionBridge>
+    </OidcProvider>
   )
+}
+
+function SessionBridge({ children }: { children: React.ReactNode }) {
+  const oidc = useOidc()
+  const queryClient = useQueryClient()
+  const user = oidc.user && !oidc.user.expired ? oidc.user : null
 
   const value = useMemo<Auth>(
     () => ({
-      loading: raw === null,
-      session: raw ? (JSON.parse(raw) as Session) : null,
-      signIn: ({ email }) => startDevSession(email.split("@")[0], email),
-      signUp: ({ name, email }) => startDevSession(name, email),
-      signOut: () => {
-        void queryClient.cancelQueries()
+      loading: oidc.isLoading,
+      session: user && {
+        accessToken: user.access_token,
+        user: {
+          sub: user.profile.sub,
+          email: user.profile.email ?? "",
+          name:
+            user.profile.name ??
+            user.profile.email?.split("@")[0] ??
+            "Homie user",
+        },
+      },
+      error: oidc.error
+        ? "Couldn't sign you in. Check your connection and try again."
+        : null,
+      signIn: async () => {
+        await oidc.signinRedirect()
+      },
+      signOut: async () => {
+        await queryClient.cancelQueries()
         queryClient.clear()
-        write(null)
+        await oidc.removeUser()
+        // Cognito's discovery has no end_session_endpoint, so end its session by hand.
+        const logout = new URL("/logout", DOMAIN)
+        logout.searchParams.set("client_id", CLIENT_ID)
+        logout.searchParams.set("logout_uri", window.location.origin)
+        window.location.assign(logout)
       },
     }),
-    [raw, queryClient],
+    [oidc, user, queryClient],
   )
 
   return <AuthContext value={value}>{children}</AuthContext>
 }
+
+const AuthContext = createContext<Auth | null>(null)
 
 export function useAuth() {
   const auth = use(AuthContext)
