@@ -1,10 +1,21 @@
 # P0 Plan 1 — Foundation + Memory Implementation Plan
 
-Revised: 2026-10-10 — mobile-first Next.js PWA. This document plans implementation; its checkboxes remain unchecked.
+Revised: 2026-10-15 — hackathon demo path and MCP SDK update. This document plans implementation; its checkboxes remain unchecked.
+
+> **Hackathon access update:** [Devpost's FAQ](https://amazonappdev2026.devpost.com/details/faqs)
+> says participants cannot use the preview Alexa+ Toolkit, CLI, web simulator, or
+> device integration. The P0 demo uses our own authenticated web MCP client to
+> send `initialize`, `tools/list`, and `tools/call` to `/mcp` over Streamable HTTP.
+> Task 2's Alexa-specific procedure is retained for future partner access and
+> is not a hackathon gate. The real-phone PWA tests remain required for homie.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the first end-to-end slice of homie: Cognito-authenticated Alexa+ MCP server with `remember` / `recall` / `forget`, a memory REST API, and an installable mobile-first Next.js PWA where a signed-in user views and edits their memories. P0 is online-first with an offline fallback, with responsive desktop support.
+**Goal:** Ship the first end-to-end slice of homie: a Cognito-authenticated,
+self-hosted MCP server with `remember` / `recall` / `forget`, a memory REST API,
+and an installable mobile-first Next.js PWA where a signed-in user views and
+edits their memories. P0 is online-first with an offline fallback and responsive
+desktop support.
 
 **Architecture:** One FastAPI app serves the MCP endpoint (official `mcp` v2 SDK, stateless Streamable HTTP, mounted at `/mcp`) and the `/api/*` REST routes; both call `app/services/memory.py`, which stores items in a single DynamoDB table keyed by the Cognito `sub`. Every request carries a Cognito access token verified against the pool's JWKS. The Next.js 16 dashboard signs in with Cognito Hosted UI + PKCE (`react-oidc-context`) and calls the REST API with typed `openapi-fetch` + TanStack Query.
 
@@ -12,7 +23,7 @@ Revised: 2026-10-10 — mobile-first Next.js PWA. This document plans implementa
 
 **Spec:** `docs/superpowers/specs/2026-10-03-p0-design.md` (sections 2, 3, 4, 5, 6, 7, 8, 9, 11, 12 milestones 0–2).
 
-**Later plans (not this one):** Plan 2 Google (Calendar + Maps + profile/Google settings), Plan 3 Media (S3) + Simulator (Bedrock), Plan 4 Deploy (EC2 + Caddy + Alexa registration + latency script). Plan 1 now includes minimal account/installation Settings and stable HTTPS phone testing via a named tunnel; production deployment stays in Plan 4.
+**Later plans (not this one):** Plan 2 Google (Calendar + Maps + profile/Google settings), Plan 3 Media (S3) + Simulator (Bedrock), Plan 4 Deploy (AWS API HTTPS + hosted Next.js frontend + self-hosted MCP demo + latency script). Plan 1 includes minimal account/installation Settings and PWA implementation. Test login and installation on the deployed frontend URL as soon as an initial hosted build and AWS API are available; final deployment and demo acceptance stay in Plan 4.
 
 ## Global Constraints
 
@@ -29,7 +40,7 @@ Revised: 2026-10-10 — mobile-first Next.js PWA. This document plans implementa
 - Client: mobile-first from 375 px, tap targets ≥ 44 px, safe-area and keyboard handling, loading/empty/error/connectivity states, confirm destructive actions (AGENTS.md checklist). Prettier style: no semicolons.
 - PWA: manifest/icons, standalone launch, installation help and generic offline fallback. App releases rely on normal user-initiated refreshes; no update prompts or release coordination. No offline writes, background sync, persistent private-data caches, web push, native wrapper or phone geolocation in P0.
 - Service-worker caching is allowlisted to the offline document and its public supporting assets only; it does not cache or manage app releases. Never cache private REST responses, authenticated HTML/RSC, OAuth callbacks, tokens or signed media URLs. User data stays in memory and is cleared on account changes.
-- Installed-app OAuth validation on real iOS/Android and a stable HTTPS origin is a foundation gate before Task 10. Browser login transfer into an installed app is not assumed.
+- Installed-app OAuth validation uses the deployed frontend HTTPS URL on the team's iOS/Android phones. Run it as soon as the hosted frontend and AWS API are available, before final demo acceptance. Browser login transfer into an installed app is not assumed.
 - Never commit `.env` files; branch + PR per milestone; stage explicit paths.
 
 ## Review Focus
@@ -55,9 +66,8 @@ infra/terraform/
   outputs.tf         (create) values for server/.env and client/.env.local
 docs/superpowers/spikes/
   2026-10-04-alexa-cognito-auth.md   (create) spike findings + decisions
-  mobile-pwa-auth.md               (create) installed-app auth results and tested device versions
-infra/caddy/dev.Caddyfile          (create) local same-origin reverse proxy behind named HTTPS tunnel
-docs/mobile-pwa-testing.md         (create) staging setup, device matrix, acceptance results
+  mobile-pwa-auth.md               (create) installed-app auth results
+docs/mobile-pwa-testing.md         (create) deployed URLs and acceptance results
 server/
   pyproject.toml     (modify) python 3.14, deps, pytest config
   .python-version    (modify) 3.14
@@ -136,8 +146,8 @@ git checkout -b feat/p0-foundation-memory
 
 Run: `uv --version && bun --version && terraform version && aws sts get-caller-identity`
 Expected: versions print and `aws sts` shows the team AWS account (configure `AWS_PROFILE` if not). `uv` may live at `~/.local/bin/uv`.
-Also confirm `caddy version`, `cloudflared --version`, a team-owned stable tunnel hostname, and access to real iOS and
-Android test devices before Task 9. These are prerequisites for installed-app acceptance, not required to run backend unit tests.
+Also confirm access to the planned AWS API deployment, a Next.js-capable frontend host, and the team's iPhones and
+Android phone. The host-assigned frontend URL is recorded when deployed; no separate testing tunnel is required.
 
 ---
 
@@ -378,17 +388,85 @@ git commit -m "feat(infra): add Cognito, DynamoDB and S3 dev stack"
 
 ---
 
-### Task 2: Spike — Alexa ↔ Cognito auth (throwaway code, committed findings)
+### Task 2: Spike — self-hosted MCP auth (Alexa partner procedure deferred)
 
-**Purpose:** answer spec §4 risk before building on it. Code written here is **not committed**; only the findings doc is.
+**P0 purpose:** check the dashboard's Cognito client configuration and that the
+pinned SDK negotiates MCP 2025-11-25 over Streamable HTTP. Task 3 implements
+token verification; Task 7 verifies authenticated MCP calls, missing/invalid-token
+rejection, and cross-user memory isolation once the tools exist. Task 9 validates
+the browser sign-in. Record findings without tokens. Throwaway spike code is not
+committed.
 
 **Files:**
 - Create: `docs/superpowers/spikes/2026-10-04-alexa-cognito-auth.md`
 
-**Interfaces:**
-- Produces: final values for `MCP_TOOLS_SCOPE`, `MCP_SERVICE_SCOPE`, `alexa_redirect_uris`, and a go/no-go on Cognito for `client_credentials` (used by Task 3 settings and the Plan 4 deploy).
+**Future partner-only interfaces:** `MCP_SERVICE_SCOPE`, `alexa_redirect_uris`,
+and a go/no-go on Cognito `client_credentials` require preview tooling. P0 uses
+the existing `MCP_TOOLS_SCOPE` with the dashboard client.
 
-- [ ] **Step 1: Does Cognito accept the `resource` parameter on `client_credentials`?**
+#### P0 checklist
+
+- [ ] **Step 1: Inspect the dashboard OAuth client.** After Task 1's Terraform
+  apply, run the following from the repo root. Confirm the `code` flow, the
+  `homie/mcp:tools` scope, and an `/auth/callback` URL on a configured dashboard
+  origin (localhost for local development; the deployed frontend once known). This queries
+  configuration without exposing a client secret or user token.
+
+```bash
+POOL=$(terraform -chdir=infra/terraform output -raw cognito_user_pool_id)
+CLIENT=$(terraform -chdir=infra/terraform output -raw dashboard_client_id)
+REGION=$(terraform -chdir=infra/terraform output -raw aws_region)
+aws cognito-idp describe-user-pool-client --region "$REGION" \
+  --user-pool-id "$POOL" --client-id "$CLIENT" \
+  --query 'UserPoolClient.{Flows:AllowedOAuthFlows,Scopes:AllowedOAuthScopes,Callbacks:CallbackURLs}'
+```
+
+- [ ] **Step 2: Check the SDK protocol.** In a scratch directory, create
+  `p0_spike.py` with a non-personal `ping` tool:
+
+```python
+from contextlib import asynccontextmanager
+
+from mcp.server import MCPServer
+from starlette.applications import Starlette
+from starlette.routing import Mount
+
+mcp = MCPServer("homie-p0-spike")
+
+
+@mcp.tool()
+def ping() -> str:
+    return "pong"
+
+
+@asynccontextmanager
+async def lifespan(_: Starlette):
+    async with mcp.session_manager.run():
+        yield
+
+
+app = Starlette(
+    routes=[Mount("/", mcp.streamable_http_app(stateless_http=True, json_response=True))],
+    lifespan=lifespan,
+)
+```
+
+  Run `uv run --with "mcp==2.2.0" --with uvicorn uvicorn p0_spike:app --port 8001`.
+  Connect MCP Inspector or an SDK Streamable HTTP client to
+  `http://localhost:8001/mcp`; run `initialize` and `tools/list`. Confirm the
+  negotiated version is 2025-11-25 and `ping` is listed. Task 7 verifies the
+  production auth gate and memory tool calls.
+- [ ] **Step 3: Record findings.** Write the OAuth-client and protocol results,
+  SDK version, request methods, and any blockers in
+  `docs/superpowers/spikes/2026-10-04-alexa-cognito-auth.md`, without access
+  tokens, authorization headers, or memory content. Commit only that document.
+
+#### Deferred: Alexa partner-only procedure (not a P0 gate)
+
+The following steps require partner access to the preview Alexa+ Toolkit. Leave
+them unchecked for the hackathon; run them only if that access becomes available.
+
+- [ ] **Partner step 1: Does Cognito accept the `resource` parameter on `client_credentials`?**
 
 ```bash
 DOMAIN=$(terraform -chdir=infra/terraform output -raw cognito_domain_url)
@@ -400,25 +478,27 @@ curl -s -u "$ID:$SECRET" "$DOMAIN/oauth2/token" \
   -d resource=https://example.trycloudflare.com/mcp
 ```
 
-Expected: JSON with `access_token`. Record: success or the exact error. Decode the token at a JWT debugger (or `cut -d. -f2 | base64 -d`) and record the `scope` claim string exactly (expected `homie/mcp:service`) and that `client_id` and `token_use` are present (`verify_token` requires both).
+Expected: JSON with `access_token`. Record success or the exact error. Decode the
+token locally and record only the `scope` claim string (expected
+`homie/mcp:service`) and whether `client_id` and `token_use` are present
+(`verify_token` requires both). Do not paste the token into a web debugger.
 
-- [ ] **Step 2: Discover redirect URIs, create the linking client and configure scopes**
+- [ ] **Partner step 2: Discover redirect URIs, create the linking client and configure scopes**
 
 1. Install the `alexa-ai` CLI per the [MCP Toolkit Quickstart prerequisites](https://developer.amazon.com/docs/alexaplus/add-ons/mcp-toolkit-quickstart.html), run `alexa-ai configure`, then `alexa-ai new mcp` in a scratch directory (outside the repo). Use Task 1's existing `alexa-service` credentials for service authentication and obtain the complete list of account-linking redirect URIs from the tooling/console.
 2. Set `alexa_redirect_uris` to that list in `infra/terraform/terraform.tfvars` (git-ignored), preserving any existing values for other variables. From the repo root, run `terraform -chdir=infra/terraform apply` to create Task 1's conditional `alexa-link` client before attempting account linking.
 3. Retrieve the resulting `alexa_link_client_id` and sensitive `alexa_link_client_secret` outputs and configure Alexa's account-linking settings with that client, `$DOMAIN/oauth2/authorize`, `$DOMAIN/oauth2/token` and `homie/mcp:tools`. Keep the separate `alexa-service` client and `homie/mcp:service` scope for service authentication. Keep credentials out of committed files and findings.
 4. Record the registered redirect URIs and whether the CLI/console accepts the prefixed scopes. Continue to Step 3's account-linking test only after the linking client exists and its credentials and callbacks are configured.
 
-- [ ] **Step 3: Throwaway MCP endpoint behind a tunnel**
+- [ ] **Partner step 3: Throwaway MCP endpoint behind a tunnel**
 
 In the scratch directory create `spike.py`. Fill the domain, issuer and app-client IDs from Task 1/Step 2's Terraform
 outputs before running it. The spike verifies Cognito access tokens; the presence of an Authorization header alone
-is not sufficient. For this throwaway spike only, retaining the existing diagnostic header logging is an accepted
-project compromise; production code still follows the repository's no-token/credential-logging rule.
+is not sufficient. Log method, path, and MCP protocol version only; never log
+Authorization headers or token fragments.
 
 ```python
 import asyncio
-import json
 import logging
 
 import jwt
@@ -494,9 +574,10 @@ mcp_app = mcp.streamable_http_app(
 
 async def log_everything(scope, receive, send):
     if scope["type"] == "http":
-        logging.info("%s %s headers=%s", scope["method"], scope["path"],
-                     json.dumps({k.decode(): v.decode()[:40] for k, v in scope["headers"]}))
-        auth = dict(scope["headers"]).get(b"authorization")
+        headers = dict(scope["headers"])
+        protocol = headers.get(b"mcp-protocol-version", b"").decode("ascii", "replace")
+        logging.info("%s %s protocol=%s", scope["method"], scope["path"], protocol)
+        auth = headers.get(b"authorization")
         if scope["path"].startswith("/mcp"):
             if not await asyncio.to_thread(verify_spike_token, auth):
                 await Response(status_code=401)(scope, receive, send)
@@ -517,7 +598,7 @@ app = Starlette(
 Run (two terminals):
 
 ```bash
-uv run --with "mcp>=2.3" --with "pyjwt[crypto]" --with uvicorn uvicorn spike:log_everything --port 8000
+uv run --with "mcp==2.2.0" --with "pyjwt[crypto]" --with uvicorn uvicorn spike:log_everything --port 8000
 cloudflared tunnel --url http://localhost:8000
 ```
 
@@ -531,15 +612,17 @@ also have a nonempty `sub`; failure to retrieve/validate a signing key must not 
 not credentials, in the findings. Both token types can call this spike's non-personal `ping_tool`; this does not verify
 permission to read/write personal memories, which remains covered by Tasks 3 and 7.
 
-- [ ] **Step 4: Write findings and decide**
+- [ ] **Partner step 4: Write findings and decide**
 
 Create `docs/superpowers/spikes/2026-10-04-alexa-cognito-auth.md` with sections: *Questions*, *Observations* (paste the recorded values from Steps 1–3), *Decision*. Decision is one of:
 - **Cognito-only (expected):** keep scopes `homie/mcp:tools` / `homie/mcp:service` and the `alexa-link` client created in Step 2; record the registration and account-linking results from Step 3.
 - **Fallback:** Cognito rejects `resource` or Alexa rejects prefixed scopes → add a Plan-1 follow-up task "FastAPI client_credentials token endpoint" (spec §4 fallback) before Plan 4.
 
-For the hackathon, we accept missing service-token `resource` validation as a known compromise and defer enforcing it until after the hackathon, unless it blocks Alexa integration, while retaining token signature, expiry, client, scope and user-isolation checks.
+Before any future Alexa integration, decide whether service-token `resource`
+validation is required and implement it if the partner flow needs it; retain
+token signature, expiry, client, scope, and user-isolation checks.
 
-- [ ] **Step 5: Commit findings only**
+- [ ] **Partner step 5: Commit findings only**
 
 ```bash
 git add docs/superpowers/spikes/2026-10-04-alexa-cognito-auth.md
@@ -573,7 +656,7 @@ git commit -m "docs: record Alexa/Cognito auth spike findings"
 cd server
 uv python pin 3.14
 sed -i '' 's/requires-python = ">=3.13"/requires-python = ">=3.14"/' pyproject.toml
-uv add "pyjwt[crypto]" boto3 "mcp>=2.3"
+uv add "pyjwt[crypto]" boto3 "mcp==2.2.0"
 uv add --dev "moto[dynamodb,s3]"
 ```
 
@@ -1746,7 +1829,7 @@ def test_users_isolated_over_mcp(client, make_token):
 def test_service_token_can_list_but_not_call(client, make_token):
     service = make_token(sub="svc", scope=SERVICE)
     assert rpc(client, service, "tools/list").status_code == 200
-    assert "link your homie account" in error_text(call(client, service, "recall", {"query": "x"}))
+    assert "sign in to homie" in error_text(call(client, service, "recall", {"query": "x"}))
 
 
 def test_mcp_rate_limit_is_speakable(client, make_token, monkeypatch):
@@ -1792,7 +1875,7 @@ def _user(ctx: Context) -> User:
     try:
         user = verify_token(bearer_token(ctx.headers), settings.mcp_tools_scope)
     except AuthError:
-        raise ToolError("Please link your homie account in the Alexa app first.") from None
+        raise ToolError("Please sign in to homie first.") from None
     if not mcp_limiter.hit(user.sub):
         raise ToolError("You're going a bit fast. Try again in a minute.")
     return user
@@ -1907,7 +1990,9 @@ app.mount("/", mcp_app)
 - [ ] **Step 5: Run the whole suite**
 
 Run: `uv run pytest -v`
-Expected: all pass. If `test_initialize_negotiates_2025_11_25` fails because the installed SDK negotiates an older version, run `uv add "mcp>=<newer>"`; if no release supports 2025-11-25, stop and raise it with the team (it's a hard Alexa requirement).
+Expected: all pass. If `test_initialize_negotiates_2025_11_25` fails, inspect
+the SDK configuration and protocol handshake. Version 2.2.0 is documented to
+support 2025-11-25; protocol negotiation is required for the web MCP demo.
 
 - [ ] **Step 6: Manual smoke test with MCP Inspector**
 
@@ -2016,24 +2101,24 @@ git commit -m "ci: run server, client and terraform checks on PRs"
 - Modify: `client/.gitignore`, `client/package.json`, `client/src/app/layout.tsx`, `server/.gitignore`
 - Create: `client/.env.example`, `server/scripts/export_openapi.py`, `client/src/lib/env.ts`, `client/src/lib/api/client.ts`, `client/src/lib/api/schema.d.ts` (generated), `client/src/components/providers.tsx`, `client/src/components/require-auth.tsx`, `client/src/components/app-shell.tsx`, `client/src/app/auth/callback/page.tsx`, `client/src/app/(app)/layout.tsx`
 - Replace: `client/src/app/page.tsx`
-- Create: `client/src/app/(app)/settings/page.tsx`, `client/src/components/session-expired.tsx`, `infra/caddy/dev.Caddyfile`, `docs/mobile-pwa-testing.md`
+- Create: `client/src/app/(app)/settings/page.tsx`, `client/src/components/session-expired.tsx`, `docs/mobile-pwa-testing.md`
 
 **Interfaces:**
 - Consumes: OpenAPI from Task 6; Terraform outputs `cognito_issuer`, `dashboard_client_id`, `cognito_domain_url`, `mcp_tools_scope`.
 - Produces: `useApi()` → typed `openapi-fetch` client (`paths` from `schema.d.ts`) that adds the bearer token and signals expired sessions on 401; `env` object; `<RequireAuth>`, `<AppShell>`; route group `(app)` for signed-in pages and minimal Settings.
 
-- [ ] **Step 0: Stable HTTPS phone-test origin**
+- [ ] **Step 0: Prepare the deployed phone-test URLs**
 
-Use a team-owned stable named HTTPS tunnel forwarding to a local Caddy reverse proxy. Create
-`infra/caddy/dev.Caddyfile` with an HTTP listener on port 8080: route `/api/*`, `/mcp` and `/mcp/*`,
-`/.well-known/*`, and `/health` to `127.0.0.1:8000`; route everything else to `127.0.0.1:3000`.
-Run Caddy locally with this config and point the named tunnel at `http://localhost:8080`; TLS terminates at the tunnel.
-Record the chosen origin, launch commands and owner in `docs/mobile-pwa-testing.md`, without tunnel credentials.
+The user-facing address is the deployed Next.js site's public HTTPS URL (for example, the URL assigned by Netlify).
+The FastAPI/MCP server has a separate public HTTPS URL on AWS. Record both origins and the deployment owner in
+`docs/mobile-pwa-testing.md` when assigned. There is no separate tunnel or testing hostname.
 
-Add the exact origin to Task 1's `dashboard_urls` (which generates Cognito `/auth/callback` and logout URLs, and S3
-CORS); configure server CORS as needed. Never put a phone-facing `localhost` URL in the staging client build.
-For same-origin staging/production set `NEXT_PUBLIC_API_URL=` (empty); keep `http://localhost:8000` only for desktop
-local development. Confirm that generated `/api/*` paths are not prefixed twice. Production EC2/Caddy remains Plan 4.
+Add the frontend origin to Task 1's `dashboard_urls`, which generates Cognito `/auth/callback` and logout URLs, and to
+S3 CORS for browser uploads. Allow that origin in server `CORS_ORIGINS`. Build the hosted frontend with
+`NEXT_PUBLIC_API_URL` set to the AWS API's HTTPS origin; keep `http://localhost:8000` only for local desktop development.
+Set the server's `PUBLIC_BASE_URL` to its AWS HTTPS origin for future Google OAuth callbacks. The simulator page calls
+the AWS `/api/simulator/chat` endpoint; that backend invokes `/mcp`. If deployment is not available during Task 9,
+record these steps and run the hosted login/installation checks as soon as both services are deployed.
 
 - [ ] **Step 1: Dependencies and shadcn components**
 
@@ -2080,7 +2165,7 @@ Create `client/.env.example`:
 
 ```dotenv
 NEXT_PUBLIC_API_URL=http://localhost:8000
-# For HTTPS staging/production behind the same-origin proxy, set NEXT_PUBLIC_API_URL= (empty).
+# For the hosted frontend, set this to the AWS API's public HTTPS origin.
 # terraform output cognito_issuer
 NEXT_PUBLIC_COGNITO_AUTHORITY=
 # terraform output dashboard_client_id
@@ -2205,7 +2290,7 @@ follow Task 9a's rules rather than silently pausing a write for later execution.
 
 - [ ] **Step 6: Root layout** — modify `client/src/app/layout.tsx`
 
-Change `metadata` to `{ title: "homie", description: "See and control what your Alexa remembers." }`, add `import { Providers } from "@/components/providers"`, and change the body to:
+Change `metadata` to `{ title: "homie", description: "See and control what homie remembers." }`, add `import { Providers } from "@/components/providers"`, and change the body to:
 
 ```tsx
 <body className="flex min-h-full flex-col">
@@ -2240,8 +2325,8 @@ export default function Home() {
     <main className="flex min-h-dvh flex-col items-center justify-center gap-6 p-6 text-center">
       <h1 className="text-4xl font-semibold tracking-tight">homie</h1>
       <p className="text-muted-foreground max-w-md text-balance">
-        Your Alexa remembers where things are, what you like, and what&apos;s
-        coming up. See and control everything it knows, here.
+        Homie remembers where things are, what you like, and what&apos;s
+        coming up. See and control it all here.
       </p>
       <Button
         size="lg"
@@ -2446,19 +2531,20 @@ git diff --cached --name-only
 git diff --cached --check
 git commit -m "feat(client): add Cognito sign-in and app shell"
 
-git add infra/caddy/dev.Caddyfile docs/mobile-pwa-testing.md
+git add docs/mobile-pwa-testing.md
 git diff --cached --name-only
 git diff --cached --check
-git commit -m "chore(infra): document and configure HTTPS phone testing"
+git commit -m "docs(pwa): record deployed phone-test setup"
 ```
 
-The HTTPS origin's local Terraform variable changes and tunnel credentials remain uncommitted.
+The hosted frontend URL is added to Terraform `dashboard_urls` when known; deployment secrets remain uncommitted.
 
 ---
 
 ### Task 9a: PWA foundation and installed-app auth validation
 
-**Depends on:** Task 9's auth shell and stable HTTPS staging origin. Complete before Task 10.
+**Depends on:** Task 9's auth shell. Implement the PWA before Task 10; run its device acceptance after an initial hosted
+frontend and AWS API are available, before final demo acceptance.
 
 **Files:**
 - Create: `client/src/app/manifest.ts`, `client/src/app/apple-icon.png`, `client/public/icons/`, `client/public/offline.html`, `client/public/sw.js`, `client/src/components/pwa-controls.tsx`, `docs/superpowers/spikes/mobile-pwa-auth.md`
@@ -2520,12 +2606,14 @@ this task.
 
 - [ ] **Step 5: Installed-app auth spike**
 
-Build and serve the production client behind the stable HTTPS proxy. On real iOS Safari and Android Chrome, test both
+Open the deployed frontend's production build over HTTPS. Use Chrome
+on the team's available iPhones and Android phone, and test both
 browser and installed modes: first sign-in, install after browser login, fresh login from the installed app, PKCE callback,
 logout, token expiry, cold launch, and background/resume. Browser-to-app login transfer is not required; a fresh sign-in
 is acceptable. Callback completion in the usable installed app and no redirect loop are required. Do not bridge contexts
-by putting tokens in URLs or worker messages. Record OS/browser versions and evidence in `mobile-pwa-auth.md`.
-If callback/state behavior fails, resolve it and revise the plan based on the observed failure before starting Task 10.
+by putting tokens in URLs or worker messages. Record pass/fail results and blockers
+in `mobile-pwa-auth.md`; exact device and OS/browser versions are not required.
+If callback/state behavior fails, resolve it and revise the plan before final demo acceptance.
 
 - [ ] **Step 6: Verify fallback, privacy and normal refreshes**
 
@@ -2754,7 +2842,7 @@ export function MemoryCard({
               <AlertDialogHeader>
                 <AlertDialogTitle>Delete this memory?</AlertDialogTitle>
                 <AlertDialogDescription>
-                  Alexa will no longer remember: “{memory.content}”
+                  Homie will no longer remember: “{memory.content}”
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -2832,7 +2920,7 @@ export function MemoryDialog({
     const form = new FormData(e.currentTarget)
     const content = String(form.get("content") ?? "").trim()
     if (!content) {
-      toast.error("Write something for Alexa to remember.")
+      toast.error("Write something for homie to remember.")
       return
     }
     const body = {
@@ -2867,7 +2955,7 @@ export function MemoryDialog({
           className="space-y-4"
         >
           <div className="space-y-2">
-            <Label htmlFor="memory-content">What should Alexa remember?</Label>
+            <Label htmlFor="memory-content">What should homie remember?</Label>
             <Textarea
               id="memory-content"
               name="content"
@@ -2994,7 +3082,7 @@ export default function MemoriesPage() {
         <div className="text-muted-foreground rounded-md border border-dashed p-8 text-center">
           {q
             ? `Nothing matches “${q}”.`
-            : "Nothing here yet. Tell Alexa “remember my passport is in the desk drawer”, or add one yourself."}
+            : "Nothing here yet. Add a memory to get started."}
         </div>
       ) : (
         <ul className="space-y-3">
@@ -3048,7 +3136,7 @@ git commit -m "feat(client): add memories page with search, tabs, edit and delet
 
 ```bash
 # terminal 1
-cd server && cp .env.example .env   # fill from terraform outputs; COGNITO_CLIENT_IDS=["<dashboard>","<alexa-service>","<alexa-link>"]
+cd server && cp .env.example .env   # fill from terraform outputs; include the dashboard client in COGNITO_CLIENT_IDS
 uv run fastapi dev app/main.py
 # terminal 2
 cd client && bun dev
@@ -3063,11 +3151,16 @@ cd client && bun dev
 5. Browser devtools at 375 px width: no page-level horizontal scroll, bottom tab bar visible, controls ≥44 px, full-screen editor usable; desktop dialog/sidebar still work. This supplements the device matrix below.
 6. **Expired session (Review Focus 5):** expire/invalidate the test session and trigger an API call → one reauthentication notice, no redirect loop. Repeat with an unsaved editor: text remains and navigation happens only after explicit copy/discard. Complete sign-in and confirm requests recover. Never put real access tokens in test reports.
 7. Copy a fresh `access_token` from Local Storage → MCP Inspector (Task 7 Step 6) → call `remember` then `recall` → the memory shows up on `/memories` after refresh.
-8. With `cloudflared tunnel --url http://localhost:8000` and the spike's add-on config pointed at the tunnel: ask Alexa "remember my keys are on the hook", then "where are my keys?" → correct answer; the memory appears in the dashboard (same Cognito user).
+8. With MCP Inspector or the self-hosted web MCP demo, send `initialize`,
+   `tools/list`, and `tools/call` for `remember` and `recall`: save "my keys are
+   on the hook", then ask where they are. Confirm the real tool calls and that
+   the memory appears in the dashboard for the same Cognito user.
 
-**Required mobile/PWA matrix:** serve a production build on Task 9's stable HTTPS origin. Run on real iOS Safari and
-Android Chrome, each in browser and installed modes; record OS/browser versions and pass/fail evidence in
-`docs/mobile-pwa-testing.md`. Desktop Chrome/Safari get navigation/auth/CRUD regression checks.
+**Required mobile/PWA checks:** open the deployed frontend URL over HTTPS. Use
+Chrome on the team's available iPhones, Android phone, and desktop;
+check phone browser and installed modes. Record pass/fail results and blockers in
+`docs/mobile-pwa-testing.md` without an exact device or OS/browser version inventory.
+If an iPhone install/auth issue appears in Chrome, reproduce it in Safari.
 
 | Scenario | Expected result |
 |---|---|
@@ -3077,7 +3170,7 @@ Android Chrome, each in browser and installed modes; record OS/browser versions 
 | Lose network on initial read or with data already loaded | Connection message instead of false empty state/endless spinner; existing in-memory data marked stale |
 | Cold launch offline after a successful online visit | Generic offline fallback only, no private memories; Retry recovers when online |
 | Save/delete when offline or request interrupted | No queued write, duplicate retry or false success; draft retained; ambiguous outcomes reconciled with server |
-| Reconnect/resume after Alexa updates a memory | Session checked and reads refreshed; current server data appears |
+| Reconnect/resume after an MCP client updates a memory | Session checked and reads refreshed; current server data appears |
 | Sign out, then sign in as another test user | Query cache cleared; previous user's data never flashes or returns from worker caches |
 | Inspect Cache Storage and private API headers | Only allowlisted public assets/offline document cached; private responses use `no-store` |
 | Deploy second app build without changing the worker while an editor is dirty | Open pages stay mounted with drafts intact; after finishing/discarding work, a normal online refresh loads the new app; no update prompt or forced reload |
@@ -3088,7 +3181,7 @@ foreground interruption and retry with a fresh presigned URL. Neither capability
 
 - [ ] **Step 3: Update `AGENTS.md`**
 
-Preserve the mobile-first/PWA checklist already in `AGENTS.md`. Document the stable phone-test origin and production
+Preserve the mobile-first/PWA checklist already in `AGENTS.md`. Document the deployed frontend URL and production
 build workflow by linking `docs/mobile-pwa-testing.md`; keep credentials out of the docs.
 
 In the layout section change `Python 3.13` → `Python 3.14`. Add under **Commands**:
@@ -3105,10 +3198,11 @@ Add a section:
 1. Get dev values from the team password manager (or `terraform -chdir=infra/terraform output`).
 2. `server/.env` from `server/.env.example`; AWS creds via `AWS_PROFILE`.
 3. `client/.env.local` from `client/.env.example`.
-4. Alexa testing: `cloudflared tunnel --url http://localhost:8000`, point the add-on at `<tunnel>/mcp`.
-   See `docs/superpowers/spikes/2026-10-04-alexa-cognito-auth.md`.
-5. Phone/PWA testing: use the stable named HTTPS tunnel + local proxy described in `docs/mobile-pwa-testing.md`.
-   Build the client with same-origin API configuration and serve a production build; do not reuse desktop localhost API URLs.
+4. MCP demo testing: open the simulator on the deployed frontend; its backend
+   calls the AWS server's `/mcp` and verifies `initialize`, `tools/list`, and
+   `tools/call` using a dashboard user token.
+5. Phone/PWA testing: open the deployed frontend URL recorded in `docs/mobile-pwa-testing.md`.
+   Build it with the AWS API's HTTPS URL, allow the frontend origin in server CORS, and do not reuse desktop localhost URLs.
 ```
 
 - [ ] **Step 4: Final checks and PR**
