@@ -1,40 +1,37 @@
 # Backend foundation
 
 From `server/`, run `uv sync`, then `uv run fastapi dev app/main.py`.
-The app creates missing tables at startup and closes database connections at shutdown.
 `GET /health` remains unauthenticated and returns `{"status": "ok"}`.
 
-Configuration is loaded from `server/.env` (see `.env.example`). `DATABASE_URL`
-defaults to `sqlite:///./homie.db`. Other synchronous SQLAlchemy database URLs
-require their corresponding driver; tag filtering currently requires SQLite
-and returns 400 on unsupported databases.
+Configuration is loaded from `server/.env` (see `.env.example`). Memories live in
+the DynamoDB table `DYNAMODB_TABLE` (keys `pk`/`sk`, see the P0 spec). When
+`DYNAMODB_ENDPOINT_URL` is set (DynamoDB Local), the app creates the table at
+startup, waiting for the endpoint to come up; against AWS the table comes from
+Terraform. Authentication uses Cognito access tokens signed by the configured
+user pool.
 Before starting Docker Compose from the repository root, create its required env
 file with `cp server/.env.example server/.env`.
-Docker Compose overrides `DATABASE_URL` to `sqlite:////data/homie.db` and stores
-memories and profiles in the persistent `homie-data` named volume. Rebuilding
-or recreating containers preserves this data; `docker compose down -v` deletes it.
-Existing local/container databases are not automatically copied into the volume.
-SQLite in-memory URLs share a connection across workers; request session lifetimes
-are serialized to prevent overlapping transactions on that connection.
-Schema changes to an existing database require migrations; automatic table creation
-does not alter existing tables. Alembic and real Alexa authentication are deferred.
+Docker Compose runs DynamoDB Local with its data in the `dynamodb-data` named
+volume, so rebuilding or recreating containers keeps memories;
+`docker compose down -v` deletes them.
 
-## Development authentication
+## Cognito authentication
 
-Authentication fails closed by default. For local development, explicitly set
-`ALLOW_MOCK_AUTH=true` with `JWT_SECRET` empty, then send an `Authorization` header with scheme `Bearer`
-and the desired user sub as the token. The token itself
-is treated as a mock Alexa `sub`; it is **not verified**. Use this only on a trusted
-local machine, never on a public deployment. Setting `JWT_SECRET` to a nonempty
-value disables mock authentication and returns 503 until real OAuth/JWT
-verification is implemented. It does not yet enable signed JWT authentication.
-Without the explicit mock opt-in, authenticated memory routes return 503.
-Memory routes are limited to 120 requests per user per minute in each process.
+Set `COGNITO_USER_POOL_ID` and the allowed `COGNITO_CLIENT_IDS` (a comma-separated
+list or JSON array) for the deployment. The API verifies RS256 signatures against
+the pool's cached JWKS, checks the issuer, access-token use, client ID, expiration,
+and required scope. Memory API requests require `MCP_TOOLS_SCOPE`; requests under
+`/mcp` require `MCP_SERVICE_SCOPE`. Invalid or missing credentials return 401.
+There is no mock-auth bypass. The sample pool and client IDs are development
+defaults only; configure your own values for deployed environments.
+
+Authenticated memory API requests are limited to 120 requests per user per minute
+and MCP requests to 60, per process.
 
 ## Memory API
 
 ```sh
-AUTH_HEADER="$(printf '%s %s' 'Bearer' 'alice')"
+AUTH_HEADER="$(printf '%s %s' 'Bearer' "$COGNITO_ACCESS_TOKEN")"
 curl -X POST http://127.0.0.1:8000/memories \
   -H "Authorization: $AUTH_HEADER" \
   -H 'Content-Type: application/json' \
@@ -54,9 +51,9 @@ up to 50 characters each, trimmed and deduplicated, with case preserved.
 Repeated content creates separate memories with different IDs.
 List supports `0 <= skip <= 2**63 - 1`, `1 <= limit <= 100` (default 50), and repeated `tags`
 query parameters. All specified tags must match exactly, before pagination.
-Results are ordered newest first with an ID tie-breaker.
+Results are ordered newest first (IDs are UUIDv7, so key order is creation order).
 
-Profiles are created on first memory creation with timezone `UTC`. All database
+A user without a stored profile gets the default timezone `UTC`. All database
 timestamps are UTC; responses convert them using the stored profile's IANA
 timezone, including daylight-saving offsets. Profile editing is not exposed
 in this phase. Memory bodies cannot override the profile timezone.

@@ -1,11 +1,62 @@
+import json
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread, local
 from typing import Any
 
 import boto3
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from moto import mock_aws
 
 from app.config import settings
+from app.services import memory_service
+
+TEST_CLIENT_ID = "test-client"
+TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/test_pool"
+
+
+@pytest.fixture(scope="session")
+def test_signing_key() -> rsa.RSAPrivateKey:
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+@pytest.fixture
+def fake_jwks_endpoint(
+    monkeypatch: pytest.MonkeyPatch, test_signing_key: rsa.RSAPrivateKey
+) -> Iterator[str]:
+    public_jwk = jwt.algorithms.RSAAlgorithm.to_jwk(test_signing_key.public_key(), as_dict=True)
+    public_jwk.update({"kid": "test-key", "use": "sig", "alg": "RS256"})
+    jwks = {"keys": [public_jwk]}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = json.dumps(jwks).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    issuer = TEST_ISSUER
+    monkeypatch.setattr(type(settings), "cognito_issuer", property(lambda _self: issuer))
+    monkeypatch.setattr(
+        type(settings),
+        "cognito_jwks_url",
+        property(lambda _self: f"http://127.0.0.1:{server.server_port}/jwks"),
+    )
+    monkeypatch.setattr(settings, "cognito_client_ids", [TEST_CLIENT_ID])
+    yield issuer
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
 
 
 @pytest.fixture(autouse=True)
@@ -21,6 +72,7 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "aws_region", "us-east-1")
     monkeypatch.setattr(settings, "dynamodb_table", "homie-test")
     monkeypatch.setattr(settings, "dynamodb_endpoint_url", None)
+    monkeypatch.setattr(memory_service, "_thread", local())
 
 
 @pytest.fixture

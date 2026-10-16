@@ -14,7 +14,7 @@ Alexa+ integrations go through **MCP** (spec 2025-11-25 or later, **Streamable H
 ## Layout
 
 ```
-server/   Python 3.13, FastAPI, uv
+server/   Python 3.14, FastAPI, uv
   app/main.py      FastAPI app, middleware, router registration
   app/config.py    Settings (pydantic-settings, reads server/.env)
   app/routes/      HTTP routers — thin: parse request, call a service, return

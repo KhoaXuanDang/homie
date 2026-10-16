@@ -1511,7 +1511,7 @@ git commit -m "feat(server): add DynamoDB memory service with keyword recall"
 
 **Interfaces:**
 - Consumes: `CurrentUser`, memory service functions, memory models.
-- Produces: `GET /api/memories?kind=&q=&limit=` → `list[Memory]`; `POST /api/memories` (201) → `Memory`; `PATCH /api/memories/{memory_id}` → `Memory` | 404; `DELETE /api/memories/{memory_id}` → 204 | 404. OpenAPI schema names `Memory`, `MemoryCreate`, `MemoryUpdate` (consumed by client typegen in Task 9).
+- Produces: `GET /api/memories?kind=&q=&limit=` → `list[Memory]`; `POST /api/memories` (201) → `Memory`; `GET /api/memories/{memory_id}` → `Memory` | 404 (dashboard detail page); `PATCH /api/memories/{memory_id}` → `Memory` | 404; `DELETE /api/memories/{memory_id}` → 204 | 404. OpenAPI schema names `Memory`, `MemoryCreate`, `MemoryUpdate` (consumed by client typegen in Task 9).
 
 **Required create-contract extension to the scaffolds below:** `POST /api/memories` requires an `Idempotency-Key`
 header validated as a UUID with FastAPI `Header`, and passes it as `request_id` to Task 5 Step 4a's service. Keep the
@@ -1616,6 +1616,14 @@ def list_memories(
 @router.post("", status_code=201)
 def create_memory(user: CurrentUser, body: MemoryCreate) -> Memory:
     return memory.create_memory(user.sub, body)
+
+
+@router.get("/{memory_id}")
+def get_memory(user: CurrentUser, memory_id: UUID) -> Memory:
+    found = memory.get_memory(user.sub, memory_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return found
 
 
 @router.patch("/{memory_id}")
