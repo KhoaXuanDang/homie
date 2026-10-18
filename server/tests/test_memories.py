@@ -1,6 +1,8 @@
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from time import time
+from typing import Any
+from uuid import uuid4, uuid7
 
 import httpx
 import jwt
@@ -13,7 +15,8 @@ from app import main
 from app.config import Settings
 from app.middleware import auth as auth_middleware
 from app.middleware.auth import RateLimiter, current_user
-from app.services.memory_service import MemoryService
+from app.routes.memories import get_memory_service
+from app.services.memory_service import IdempotencyInProgressError, MemoryService
 
 TEST_CLIENT_ID = "test-client"
 _test_signing_key: rsa.RSAPrivateKey | None = None
@@ -39,7 +42,10 @@ def token(user_sub: str = "alice", **overrides: object) -> str:
 
 
 def auth(user_sub: str = "alice", **overrides: object) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token(user_sub, **overrides)}"}
+    return {
+        "Authorization": f"Bearer {token(user_sub, **overrides)}",
+        "Idempotency-Key": str(uuid4()),
+    }
 
 
 @pytest.fixture
@@ -54,17 +60,21 @@ def client(
     _test_signing_key = test_signing_key
     monkeypatch.setattr(main.app.state, "api_rate_limiter", RateLimiter(max_requests=120))
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=60))
+    main.app.dependency_overrides[get_memory_service] = lambda: MemoryService(table=ddb_table)
     with TestClient(main.app) as client:
-        yield client
+        try:
+            yield client
+        finally:
+            main.app.dependency_overrides.pop(get_memory_service, None)
 
 
 def test_api_crud(client: TestClient) -> None:
     response = client.post(
-        "/memories",
+        "/api/memories",
         headers=auth(),
         json={
             "content": "Keys in drawer",
-            "memory_type": "item_location",
+            "kind": "item_location",
             "tags": ["home", "home"],
         },
     )
@@ -73,55 +83,119 @@ def test_api_crud(client: TestClient) -> None:
     assert memory["user_sub"] == "alice"
     assert memory["tags"] == ["home"]
     assert memory["timezone"] == "UTC"
-    url = f"/memories/{memory['id']}"
+    url = f"/api/memories/{memory['id']}"
     assert client.get(url, headers=auth()).json() == memory
-    assert client.get("/memories", headers=auth(), params={"tags": "home"}).json() == [memory]
-    updated = client.put(url, headers=auth(), json={"content": "Keys in bag"})
+    assert client.get("/api/memories", headers=auth(), params={"q": "drawer"}).json() == [memory]
+    updated = client.patch(url, headers=auth(), json={"content": "Keys in bag"})
     assert updated.status_code == 200
     assert updated.json()["content"] == "Keys in bag"
     assert updated.json()["tags"] == ["home"]
+    assert client.put(url, headers=auth(), json={"content": "Legacy update"}).status_code == 405
     deleted = client.delete(url, headers=auth())
     assert deleted.status_code == 204
     assert deleted.content == b""
     assert client.get(url, headers=auth()).status_code == 404
     assert client.delete(url, headers=auth()).status_code == 404
-    assert client.get("/memories", headers=auth()).json() == []
+    assert client.get("/api/memories", headers=auth()).json() == []
 
 
-@pytest.mark.parametrize("method", ["get", "put", "delete"])
+def test_idempotent_create_replays_after_lost_response(client: TestClient) -> None:
+    headers = auth()
+    body = {"content": "Spare key in the cabinet", "kind": "item_location"}
+    first = client.post("/api/memories", headers=headers, json=body)
+    retry = client.post("/api/memories", headers=headers, json=body)
+    assert first.status_code == retry.status_code == 201
+    assert retry.json() == first.json()
+    assert len(client.get("/api/memories", headers=auth()).json()) == 1
+
+
+def test_idempotency_conflict_and_deleted_memory_return_409_and_410(client: TestClient) -> None:
+    headers = auth()
+    first = client.post(
+        "/api/memories", headers=headers, json={"content": "Original", "kind": "fact"}
+    )
+    conflict = client.post(
+        "/api/memories", headers=headers, json={"content": "Changed", "kind": "fact"}
+    )
+    assert first.status_code == 201
+    assert conflict.status_code == 409
+
+    assert client.delete(f"/api/memories/{first.json()['id']}", headers=auth()).status_code == 204
+    gone = client.post(
+        "/api/memories", headers=headers, json={"content": "Original", "kind": "fact"}
+    )
+    assert gone.status_code == 410
+    assert client.get("/api/memories", headers=auth()).json() == []
+
+
+def test_idempotency_transaction_in_progress_returns_retryable_409(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def in_progress(*args: Any, **kwargs: Any) -> None:
+        raise IdempotencyInProgressError("Request in progress, try again")
+
+    monkeypatch.setattr(MemoryService, "create_memory", in_progress)
+    response = client.post(
+        "/api/memories",
+        headers=auth(),
+        json={"content": "A fact", "kind": "fact"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Request in progress, try again"}
+
+
+@pytest.mark.parametrize("key", [None, "not-a-uuid"])
+def test_idempotency_key_required_and_validated(client: TestClient, key: str | None) -> None:
+    headers = auth()
+    headers.pop("Idempotency-Key")
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    response = client.post(
+        "/api/memories", headers=headers, json={"content": "A fact", "kind": "fact"}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("method", ["get", "patch", "delete"])
 def test_api_user_isolation(client: TestClient, method: str) -> None:
     memory = client.post(
-        "/memories", headers=auth(), json={"content": "Private", "memory_type": "fact"}
+        "/api/memories", headers=auth(), json={"content": "Private", "kind": "fact"}
     ).json()
     response = client.request(
         method,
-        f"/memories/{memory['id']}",
+        f"/api/memories/{memory['id']}",
         headers=auth("bob"),
-        **({"json": {"content": "Overwrite"}} if method == "put" else {}),
+        **({"json": {"content": "Overwrite"}} if method == "patch" else {}),
     )
     assert response.status_code == 404
     assert response.json() == {"detail": "Memory not found"}
-    assert client.get("/memories", headers=auth("bob")).json() == []
-    assert client.get(f"/memories/{memory['id']}", headers=auth()).json() == memory
+    assert client.get("/api/memories", headers=auth("bob")).json() == []
+    assert client.get(f"/api/memories/{memory['id']}", headers=auth()).json() == memory
 
 
 @pytest.mark.parametrize(
     ("method", "path", "data"),
     [
-        ("get", "/memories", None),
-        ("post", "/memories", {"content": "x", "memory_type": "fact"}),
-        ("get", "/memories/missing", None),
-        ("put", "/memories/missing", {"content": "x"}),
-        ("delete", "/memories/missing", None),
+        ("get", "/api/memories", None),
+        ("post", "/api/memories", {"content": "x", "kind": "fact"}),
+        ("get", f"/api/memories/{uuid7()}", None),
+        ("patch", f"/api/memories/{uuid7()}", {"content": "x"}),
+        ("delete", f"/api/memories/{uuid7()}", None),
     ],
 )
 def test_auth_required(client: TestClient, method: str, path: str, data: dict | None) -> None:
-    assert client.request(method, path, json=data).status_code == 401
+    assert (
+        client.request(
+            method, path, json=data, headers={"Idempotency-Key": str(uuid4())}
+        ).status_code
+        == 401
+    )
 
 
 @pytest.mark.parametrize("token", ["", "a b", "x" * 256])
 def test_invalid_tokens(client: TestClient, token: str) -> None:
-    response = client.get("/memories", headers={"Authorization": f"Bearer {token}"})
+    response = client.get("/api/memories", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 401
     assert "www-authenticate" not in response.headers
 
@@ -159,14 +233,16 @@ def test_signature_must_match_the_cached_jwks(
         algorithm="RS256",
         headers={"kid": "test-key"},
     )
-    assert client.get("/memories", headers={"Authorization": f"Bearer {valid}"}).status_code == 200
-    response = client.get("/memories", headers={"Authorization": f"Bearer {forged}"})
+    assert (
+        client.get("/api/memories", headers={"Authorization": f"Bearer {valid}"}).status_code == 200
+    )
+    response = client.get("/api/memories", headers={"Authorization": f"Bearer {forged}"})
     assert response.status_code == 401
     assert "www-authenticate" not in response.headers
 
 
 def test_missing_credentials_return_clean_401(client: TestClient) -> None:
-    for path in ("/memories", "/mcp"):
+    for path in ("/api/memories", "/mcp"):
         response = client.get(path)
         assert response.status_code == 401
         assert "www-authenticate" not in response.headers
@@ -176,7 +252,7 @@ def test_legacy_mock_auth_environment_variable_is_inactive(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
-    response = client.get("/memories", headers={"Authorization": "Bearer alice"})
+    response = client.get("/api/memories", headers={"Authorization": "Bearer alice"})
     assert response.status_code == 401
     assert "www-authenticate" not in response.headers
     assert client.get("/health").json() == {"status": "ok"}
@@ -195,7 +271,7 @@ def test_legacy_mock_auth_environment_variable_is_inactive(
 def test_invalid_cognito_claims_return_clean_401(
     client: TestClient, overrides: dict[str, object]
 ) -> None:
-    response = client.get("/memories", headers=auth("alice", **overrides))
+    response = client.get("/api/memories", headers=auth("alice", **overrides))
     assert response.status_code == 401
     assert response.json() == {"detail": "Invalid or missing authentication token."}
     assert "www-authenticate" not in response.headers
@@ -230,7 +306,7 @@ def test_mcp_auth_gate_requires_service_scope_and_has_its_own_limiter(
     assert tools_limited.status_code == 429
 
     # The separate API limiter remains unaffected by MCP requests.
-    assert client.get("/memories", headers=auth()).status_code == 200
+    assert client.get("/api/memories", headers=auth()).status_code == 200
 
 
 def test_mcp_gate_only_attaches_user_sub_for_linked_user_tokens(
@@ -281,12 +357,12 @@ def test_jwks_refresh_http_error_uses_stale_cached_keys(
 @pytest.mark.parametrize("field", ["user_sub", "id", "timezone", "created_at", "updated_at"])
 def test_protected_fields(client: TestClient, field: str) -> None:
     response = client.post(
-        "/memories",
+        "/api/memories",
         headers=auth(),
-        json={"content": "Private", "memory_type": "fact", field: "forged"},
+        json={"content": "Private", "kind": "fact", field: "forged"},
     )
     assert response.status_code == 422
-    response = client.put("/memories/missing", headers=auth(), json={field: "forged"})
+    response = client.patch(f"/api/memories/{uuid7()}", headers=auth(), json={field: "forged"})
     assert response.status_code == 422
 
 
@@ -298,60 +374,75 @@ def test_protected_fields(client: TestClient, field: str) -> None:
         {"content": None},
         {"tags": None},
         {"tags": [""]},
-        {"tags": ["x"] * 21},
-        {"content": "x" * 10001},
+        {"tags": ["x"] * 11},
+        {"content": "x" * 2001},
     ],
 )
 def test_invalid_update(client: TestClient, data: dict[str, object]) -> None:
-    assert client.put("/memories/missing", headers=auth(), json=data).status_code == 422
+    assert client.patch(f"/api/memories/{uuid7()}", headers=auth(), json=data).status_code == 422
 
 
 @pytest.mark.parametrize(
     "query",
     [
-        "skip=-1",
-        f"skip={2**63}",
         "limit=0",
-        "limit=101",
+        "limit=201",
         "limit=no",
-        "tags=",
-        "tags=" + "x" * 51,
-        "&".join(["tags=x"] * 21),
+        "kind=secret",
+        "q=" + "x" * 201,
     ],
 )
 def test_invalid_list_parameters(client: TestClient, query: str) -> None:
-    assert client.get(f"/memories?{query}", headers=auth()).status_code == 422
+    assert client.get(f"/api/memories?{query}", headers=auth()).status_code == 422
 
 
-def test_api_tag_filter_pagination(client: TestClient) -> None:
-    for tags in [["home"], ["home", "keys"], ["homework"]]:
+def test_api_kind_and_best_first_search(client: TestClient) -> None:
+    for kind, content in [
+        ("fact", "keys are near the door"),
+        ("fact", "keys and passport are in the spare drawer"),
+        ("todo", "call the doctor"),
+    ]:
         response = client.post(
-            "/memories",
+            "/api/memories",
             headers=auth(),
-            json={"content": "Memory", "memory_type": "fact", "tags": tags},
+            json={"content": content, "kind": kind},
         )
         assert response.status_code == 201
-    response = client.get("/memories?tags=home&tags=keys&limit=1", headers=auth())
+    response = client.get("/api/memories?kind=fact&q=keys+passport", headers=auth())
     assert response.status_code == 200
-    assert len(response.json()) == 1
-    assert response.json()[0]["tags"] == ["home", "keys"]
-    assert client.get("/memories?tags=home&skip=1&limit=1", headers=auth()).json()[0]["tags"] == [
-        "home"
+    assert [item["content"] for item in response.json()] == [
+        "keys and passport are in the spare drawer",
+        "keys are near the door",
     ]
+
+
+@pytest.mark.parametrize("query", ["q=", "q=%20"])
+def test_empty_query_parameter_returns_unfiltered_memories(client: TestClient, query: str) -> None:
+    created = client.post(
+        "/api/memories",
+        headers=auth(),
+        json={"content": "Keep this memory", "kind": "fact"},
+    )
+    assert created.status_code == 201
+
+    response = client.get(f"/api/memories?{query}", headers=auth())
+
+    assert response.status_code == 200
+    assert response.json() == [created.json()]
 
 
 def test_rate_limit(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     now = [100.0]
     monkeypatch.setattr("app.middleware.auth.monotonic", lambda: now[0])
     for _ in range(120):
-        assert client.get("/memories", headers=auth()).status_code == 200
-    response = client.get("/memories", headers=auth())
+        assert client.get("/api/memories", headers=auth()).status_code == 200
+    response = client.get("/api/memories", headers=auth())
     assert response.status_code == 429
     assert response.headers["Retry-After"] == "60"
-    assert client.get("/memories", headers=auth("bob")).status_code == 200
+    assert client.get("/api/memories", headers=auth("bob")).status_code == 200
     assert client.get("/health").status_code == 200
     now[0] += 60
-    assert client.get("/memories", headers=auth()).status_code == 200
+    assert client.get("/api/memories", headers=auth()).status_code == 200
 
 
 def test_rate_limiter_eviction_and_no_lockout() -> None:
@@ -412,7 +503,7 @@ def test_many_users_do_not_lock_out_new_users(
 ) -> None:
     monkeypatch.setattr(main.app.state, "api_rate_limiter", RateLimiter(max_entries=5))
     for i in range(15):
-        response = client.get("/memories", headers=auth(f"user_{i}"))
+        response = client.get("/api/memories", headers=auth(f"user_{i}"))
         assert response.status_code == 200
 
 
@@ -420,14 +511,14 @@ def test_concurrent_create_and_read(client: TestClient) -> None:
     with ThreadPoolExecutor(max_workers=2) as workers:
         create = workers.submit(
             client.post,
-            "/memories",
+            "/api/memories",
             headers=auth(),
-            json={"content": "Keep this memory", "memory_type": "fact"},
+            json={"content": "Keep this memory", "kind": "fact"},
         )
-        read = workers.submit(client.get, "/memories", headers=auth("bob"))
+        read = workers.submit(client.get, "/api/memories", headers=auth("bob"))
         assert create.result(timeout=5).status_code == 201
         assert read.result(timeout=5).status_code == 200
-    assert len(client.get("/memories", headers=auth()).json()) == 1
+    assert len(client.get("/api/memories", headers=auth()).json()) == 1
 
 
 def test_unexpected_errors_are_safe(
@@ -437,7 +528,7 @@ def test_unexpected_errors_are_safe(
         raise RuntimeError("sensitive memory content and database credentials")
 
     monkeypatch.setattr(MemoryService, "list_memories", fail)
-    response = client.get("/memories", headers={**auth(), "Origin": "http://localhost:3000"})
+    response = client.get("/api/memories", headers={**auth(), "Origin": "http://localhost:3000"})
     assert response.status_code == 500
     assert response.json() == {"detail": "Something went wrong. Please try again."}
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
@@ -454,28 +545,28 @@ def test_unexpected_errors_are_safe(
     [
         (
             "post",
-            "/memories",
-            {"content": "private" * 1500, "memory_type": "fact"},
+            "/api/memories",
+            {"content": "private" * 1500, "kind": "fact"},
             ["body", "content"],
-            "String should have at most 10000 characters",
+            "String should have at most 2000 characters",
         ),
         (
             "post",
-            "/memories",
-            {"content": "private", "memory_type": "fact", "tags": [""]},
+            "/api/memories",
+            {"content": "private", "kind": "fact", "tags": [""]},
             ["body", "tags", 0],
             "String should have at least 1 character",
         ),
         (
-            "put",
-            "/memories/missing",
+            "patch",
+            f"/api/memories/{uuid7()}",
             {},
             ["body"],
             "Value error, Provide at least one field to update",
         ),
         (
             "get",
-            "/memories?limit=private",
+            "/api/memories?limit=private",
             None,
             ["query", "limit"],
             "Input should be a valid integer, unable to parse string as an integer",
