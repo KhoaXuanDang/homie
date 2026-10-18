@@ -598,3 +598,12 @@ def test_current_user_dependency_attaches_authenticated_sub(client: TestClient) 
     user = current_user(request)
     assert user.sub == "alice"
     assert request.state.user_sub == "alice"
+
+
+def test_api_responses_are_never_cached(client: TestClient) -> None:
+    ok = client.get("/api/memories", headers=auth())
+    unauthorized = client.get("/api/memories")
+    invalid = client.post("/api/memories", headers=auth(), json={"content": ""})
+    assert [r.status_code for r in (ok, unauthorized, invalid)] == [200, 401, 422]
+    assert all(r.headers["cache-control"] == "no-store" for r in (ok, unauthorized, invalid))
+    assert "cache-control" not in client.get("/health").headers
