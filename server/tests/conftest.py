@@ -1,14 +1,13 @@
 import json
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Lock, Thread, local
+from threading import Thread, local
 from typing import Any
 from uuid import uuid4
 
 import boto3
 import jwt
 import pytest
-from boto3.dynamodb.types import TypeDeserializer
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -80,7 +79,7 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def ddb_table(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+def ddb_table() -> Iterator[Any]:
     with mock_aws():
         dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
         table = dynamodb.create_table(
@@ -95,32 +94,6 @@ def ddb_table(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
             ],
             BillingMode="PAY_PER_REQUEST",
         )
-        # Moto 5.2.4 currently fails parsing DynamoDB TransactWriteItems. Keep
-        # transaction semantics in this fixture while the app uses the real API.
-        transaction_lock = Lock()
-        deserializer = TypeDeserializer()
-
-        def transact_write_items(
-            *, TransactItems: list[dict[str, Any]], **_: Any
-        ) -> dict[str, Any]:
-            with transaction_lock:
-                writes = [operation["Put"] for operation in TransactItems]
-                decoded = [
-                    {key: deserializer.deserialize(value) for key, value in write["Item"].items()}
-                    for write in writes
-                ]
-                if any(
-                    table.get_item(Key={"pk": item["pk"], "sk": item["sk"]}).get("Item")
-                    for item in decoded
-                ):
-                    raise ClientError(
-                        {"Error": {"Code": "TransactionCanceledException"}}, "TransactWriteItems"
-                    )
-                for item in decoded:
-                    table.put_item(Item=item)
-            return {}
-
-        monkeypatch.setattr(table.meta.client, "transact_write_items", transact_write_items)
         yield table
 
 

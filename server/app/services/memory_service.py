@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo
 
 import boto3
 from boto3.dynamodb.conditions import Key
-from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError, EndpointConnectionError
 from pydantic import TypeAdapter, ValidationError
 
@@ -25,7 +24,6 @@ logger = logging.getLogger(__name__)
 _user_sub_adapter = TypeAdapter(UserSub)
 _limit_adapter = TypeAdapter(Limit)
 _kind_adapter = TypeAdapter(Kind)
-_serializer = TypeSerializer()
 _MAX_ITEMS = 2000
 _Ranked = TypeVar("_Ranked")
 _STOPWORDS = frozenset(
@@ -186,14 +184,14 @@ class MemoryService:
                         {
                             "Put": {
                                 "TableName": self.table.name,
-                                "Item": self._serialize_item(item),
+                                "Item": item,
                                 "ConditionExpression": "attribute_not_exists(pk)",
                             }
                         },
                         {
                             "Put": {
                                 "TableName": self.table.name,
-                                "Item": self._serialize_item(request_item),
+                                "Item": request_item,
                                 "ConditionExpression": "attribute_not_exists(pk)",
                             }
                         },
@@ -234,10 +232,6 @@ class MemoryService:
             raise IdempotencyRecordDeletedError("The memory created by this request was deleted")
         # P0 intentionally replays the memory's latest state, even if it changed after creation.
         return self._to_memory(item, *self._timezone(user_sub))
-
-    @staticmethod
-    def _serialize_item(item: dict[str, Any]) -> dict[str, Any]:
-        return {key: _serializer.serialize(value) for key, value in item.items()}
 
     @staticmethod
     def _tokens(text: str) -> set[str]:
@@ -330,12 +324,9 @@ class MemoryService:
         kind: Kind | None = None,
         query: str | None = None,
         limit: int = 50,
-        *,
-        _internal_limit: bool = False,
     ) -> list[Memory]:
         user_sub = self._validate_sub(user_sub)
-        if not _internal_limit:
-            _limit_adapter.validate_python(limit)
+        _limit_adapter.validate_python(limit)
         if kind is not None:
             _kind_adapter.validate_python(kind)
         has_query = bool(query and query.strip())
@@ -345,7 +336,7 @@ class MemoryService:
         )
         if kind is not None:
             records = [record for record in records if record["kind"] == kind]
-        if query and query.strip():
+        if has_query:
             records = self._rank_records(records, query.strip())
         return self._to_memories(user_sub, records[:limit])
 
@@ -353,8 +344,16 @@ class MemoryService:
         self, user_sub: str, query: str, kind: Kind | None = None, limit: int = 10
     ) -> list[Memory]:
         _limit_adapter.validate_python(limit)
-        memories = self.list_memories(user_sub, kind=kind, limit=_MAX_ITEMS, _internal_limit=True)
-        return (self._rank(memories, query) or memories)[: min(limit, 10)]
+        user_sub = self._validate_sub(user_sub)
+        if kind is not None:
+            _kind_adapter.validate_python(kind)
+
+        memories = self.list_memories(user_sub, kind=kind, limit=200)
+        if query and query.strip():
+            ranked = self._rank(memories, query.strip())
+            if ranked:
+                return ranked[: min(limit, 10)]
+        return memories[: min(limit, 10)]
 
     def update_memory(self, user_sub: str, memory_id: str, **updates: Any) -> Memory:
         user_sub = self._validate_sub(user_sub)
