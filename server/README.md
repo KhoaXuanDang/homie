@@ -34,24 +34,29 @@ and MCP requests to 60, per process.
 AUTH_HEADER="$(printf '%s %s' 'Bearer' "$COGNITO_ACCESS_TOKEN")"
 curl -X POST http://127.0.0.1:8000/memories \
   -H "Authorization: $AUTH_HEADER" \
+  -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
   -H 'Content-Type: application/json' \
-  -d '{"content":"Keys are in the drawer","memory_type":"item_location","tags":["home"]}'
-curl http://127.0.0.1:8000/memories?limit=20 \
+  -d '{"content":"Keys are in the drawer","kind":"item_location","tags":["home"]}'
+curl http://127.0.0.1:8000/api/memories?limit=20 \
   -H "Authorization: $AUTH_HEADER"
 ```
 
-Use `GET /memories/{id}`, `PUT /memories/{id}` with one or more of `content`,
-`memory_type`, and `tags`, or `DELETE /memories/{id}` (204, no body).
+Memory routes live under `/api/memories`. Use `GET /api/memories/{id}`,
+`PATCH /api/memories/{id}` with one or more of `content`, `kind`, `tags`, and
+`event_id`, or `DELETE /api/memories/{id}` (204, no body). The create request
+requires an `Idempotency-Key` UUID. Replaying the same key and normalized body
+returns the original memory with 201; reusing it for a different body returns
+409, and retrying after deleting the created memory returns 410.
 Unknown IDs and other users' IDs both return 404. Ownership, IDs, and timestamps
 cannot be supplied in create/update bodies. Empty/null updates are rejected.
 
-Content is trimmed and bounded to 1–10,000 characters; `memory_type` is a
-nonempty string of up to 50 characters. Tags are at most 20 nonempty strings of
-up to 50 characters each, trimmed and deduplicated, with case preserved.
-Repeated content creates separate memories with different IDs.
-List supports `0 <= skip <= 2**63 - 1`, `1 <= limit <= 100` (default 50), and repeated `tags`
-query parameters. All specified tags must match exactly, before pagination.
-Results are ordered newest first (IDs are UUIDv7, so key order is creation order).
+Content is trimmed and bounded to 1–2,000 characters; `kind` is one of
+`item_location`, `fact`, `preference`, or `todo`. Tags are at most 10 nonempty
+strings of up to 40 characters each, trimmed, lowercased, and deduplicated.
+Each memory has optional `event_id` and a `media_ids` list. List supports
+`kind`, best-first `q` keyword search, and `1 <= limit <= 200` (default 50),
+with newest memories as search tie-breakers. Recall falls back to newest memories
+when the query has no matches.
 
 A user without a stored profile gets the default timezone `UTC`. All database
 timestamps are UTC; responses convert them using the stored profile's IANA
