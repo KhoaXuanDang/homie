@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread, local
 from typing import Any
+from unittest.mock import patch
 from uuid import uuid4
 
 import boto3
@@ -11,6 +12,7 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi.testclient import TestClient
 from moto import mock_aws
 
 from app.config import settings
@@ -18,6 +20,16 @@ from app.services import memory_service
 
 TEST_CLIENT_ID = "test-client"
 TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/test_pool"
+
+
+@pytest.fixture(scope="session")
+def app_client() -> Iterator[TestClient]:
+    """Keep the SDK's single-use MCP session manager running for the test session."""
+    from app.main import app
+
+    with patch.object(settings, "dynamodb_endpoint_url", None):
+        with TestClient(app, base_url="http://localhost:8000") as client:
+            yield client
 
 
 @pytest.fixture(scope="session")
