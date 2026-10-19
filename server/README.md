@@ -53,8 +53,9 @@ The endpoint exposes three tools:
 | `forget` | `memory_id` | `{"status":"success","memory_id":"<uuid>"}` |
 
 `recall` returns at most ten memories. A blank query lists the newest memories;
-a nonblank query ranks matches and falls back to recent memories when nothing
-matches. Results are scoped to the authenticated user, omit `event_id`, and
+a nonblank query searches the user's newest 2,000 memories, ranks matches, and
+falls back to recent memories when nothing matches. Older memories are outside
+the P0 search window. Results are scoped to the authenticated user, omit `event_id`, and
 express `created_at` in the user's profile timezone (UTC by default). Missing
 or invalid inputs and unavailable storage produce a plain-language MCP tool
 error. This P0 endpoint uses preconfigured Cognito bearer tokens; MCP OAuth
