@@ -7,6 +7,7 @@ from uuid import uuid4, uuid7
 
 import boto3
 import pytest
+import requests
 from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
 from fastapi.testclient import TestClient
@@ -408,3 +409,33 @@ def test_pagination_order_cleanup_boundary_and_timezone(
     listed = media_service.list_media("alice", 2)
     assert [str(media.id) for media in listed] == [newest, oldest]
     assert listed[0].created_at.utcoffset() == timedelta(hours=-4)
+
+
+def test_delete_reconciles_late_upload(
+    media_client: TestClient, media_service: MediaService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(UTC)
+    monkeypatch.setattr("app.services.media_service.utc_now", lambda: now)
+    result = create(media_client)
+    media_id = result["media"]["id"]
+    path = f"/api/media/{media_id}"
+    assert media_client.delete(path, headers=auth()).status_code == 204
+    key = {"pk": "USER#alice", "sk": f"MEDIA#{media_id}"}
+    assert media_service.table.get_item(Key=key)["Item"]["deletion_complete"] is True
+    # An already-authorized PUT may finish after DELETE has returned.
+    response = requests.put(
+        result["upload_url"], data=b"late", headers={"Content-Type": "image/jpeg"}, timeout=5
+    )
+    assert response.status_code == 200
+    assert media_client.post(path + "/complete", headers=auth()).status_code == 404
+    assert media_client.get("/api/media", headers=auth()).json() == []
+    with pytest.raises(ClientError):
+        media_service.s3.head_object(
+            Bucket=settings.media_bucket, Key=f"users/alice/media/{media_id}.jpg"
+        )
+    assert "Item" in media_service.table.get_item(Key=key)
+    monkeypatch.setattr(
+        "app.services.media_service.utc_now", lambda: now + timedelta(hours=1, seconds=1)
+    )
+    assert media_service.cleanup_pending("alice") == 1
+    assert "Item" not in media_service.table.get_item(Key=key)

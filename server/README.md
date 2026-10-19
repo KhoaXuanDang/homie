@@ -87,8 +87,8 @@ use the same Cognito authentication and per-user isolation as memories.
   and `training_consent`. Captions are trimmed and limited to 2,000 characters;
   tags follow memory tag rules. A memory link must belong to the signed-in user;
   `memory_id: null` clears it. Other fields cannot be null or changed.
-- `DELETE /api/media/{id}` removes the S3 object and record and returns 204.
-  Unknown IDs and other users' IDs return 404.
+- `DELETE /api/media/{id}` removes the S3 object, hides the record, and returns
+  204. Unknown IDs, deleted IDs, and other users' IDs return 404.
 
 Media responses use `Cache-Control: no-store`. Uploaded media receive fresh
 15-minute presigned GET URLs with a signed `no-store` response directive; URLs
@@ -98,8 +98,11 @@ refresh lists before URL expiry (the existing client uses five minutes).
 On each list request, pending uploads older than one hour are removed for that
 user, including any abandoned object. Cleanup conditionally claims the pending
 record before touching S3, so concurrent completion cannot lose uploaded media.
-A private `deleting` marker hides in-progress deletions and blocks completion;
-it is retained on storage failures so the next list or explicit delete retries.
-It is never returned as a public media status.
+A private `deleting` marker hides deletions and blocks completion; it is retained
+on storage failures so the next list or explicit delete retries. After successful
+deletion, uploads less than one hour old retain a tombstone through that same
+abandonment window: a still-valid PUT or in-flight upload may otherwise recreate
+the object. Subsequent lists remove late objects and finally remove the tombstone
+once the window has elapsed. Neither markers nor tombstones are returned.
 
 Run `uv run pytest`, `uv run ruff check .`, and `uv run ruff format --check .`.

@@ -241,12 +241,22 @@ class MediaService:
         # Keep the deletion marker until S3 succeeds, so a later list/delete can retry.
         self._storage("delete_object", Bucket=settings.media_bucket, Key=item["s3_key"])
         try:
-            self.table.delete_item(
-                Key={"pk": item["pk"], "sk": item["sk"]},
-                ConditionExpression="#status = :deleting",
-                ExpressionAttributeNames={"#status": "status"},
-                ExpressionAttributeValues={":deleting": "deleting"},
-            )
+            params = {
+                "Key": {"pk": item["pk"], "sk": item["sk"]},
+                "ConditionExpression": "#status = :deleting",
+                "ExpressionAttributeNames": {"#status": "status"},
+                "ExpressionAttributeValues": {":deleting": "deleting"},
+            }
+            if _parse_utc(item["created_at"]) >= utc_now() - timedelta(hours=1):
+                # A signed PUT can still arrive after deletion; retain tracking through
+                # the abandonment window and remove any late object on subsequent lists.
+                params["ExpressionAttributeValues"][":done"] = True
+                self.table.update_item(
+                    **params,
+                    UpdateExpression="SET deletion_complete = :done",
+                )
+            else:
+                self.table.delete_item(**params)
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
                 raise
@@ -255,7 +265,7 @@ class MediaService:
         item = self.table.get_item(Key=self._key(user_sub, media_id), ConsistentRead=True).get(
             "Item"
         )
-        if not item or not self._claim_delete(item):
+        if not item or item.get("deletion_complete") or not self._claim_delete(item):
             raise MediaNotFoundError
         self._finish_delete(item)
 
