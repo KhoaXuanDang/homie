@@ -1,20 +1,27 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { useEffect } from "react"
+import { useEffect, useState } from "react"
 
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/lib/auth"
 
 export function RequireAuth({ children }: { children: React.ReactNode }) {
-  const { loading, session } = useAuth()
+  const { loading, session, signingOut } = useAuth()
   const router = useRouter()
+  const [lastSub, setLastSub] = useState<string | null>(
+    session?.user.sub ?? null,
+  )
+
+  if (session && session.user.sub !== lastSub) {
+    setLastSub(session.user.sub)
+  }
 
   useEffect(() => {
-    if (!loading && !session) router.replace("/")
-  }, [loading, session, router])
+    if (signingOut || (!loading && !session && !lastSub)) router.replace("/")
+  }, [loading, session, lastSub, router, signingOut])
 
-  if (!session) {
+  if (signingOut || (!session && !lastSub)) {
     return (
       <div className="flex min-h-dvh" aria-busy="true">
         <span className="sr-only">Loading…</span>
@@ -27,5 +34,8 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
       </div>
     )
   }
-  return children
+
+  // Keep the protected subtree mounted through token recovery; its API hooks
+  // still see the current (possibly null) session and must gate requests.
+  return <div key={session?.user.sub ?? lastSub}>{children}</div>
 }
