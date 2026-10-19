@@ -11,7 +11,12 @@ from starlette.requests import Request
 
 from app.config import settings
 from app.middleware.auth import McpAuthGate, RateLimiter
-from app.routes import health, memories
+from app.routes import health, media, memories
+from app.services.media_service import (
+    MediaNotFoundError,
+    MediaStorageError,
+    UploadNotReadyError,
+)
 from app.services.memory_service import (
     IdempotencyConflictError,
     IdempotencyInProgressError,
@@ -33,6 +38,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Homie API", lifespan=lifespan)
 app.state.api_rate_limiter = RateLimiter(max_requests=120)
 app.state.mcp_rate_limiter = RateLimiter(max_requests=60)
+app.state.media_rate_limiter = RateLimiter(max_requests=30)
+
+
+@app.exception_handler(MediaNotFoundError)
+async def media_not_found(request: Request, exc: MediaNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "Media not found"})
+
+
+@app.exception_handler(UploadNotReadyError)
+async def upload_not_ready(request: Request, exc: UploadNotReadyError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409, content={"detail": "Upload is missing or incomplete. Please upload again."}
+    )
+
+
+@app.exception_handler(MediaStorageError)
+async def media_storage_error(request: Request, exc: MediaStorageError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503, content={"detail": "Media storage is unavailable. Please try again."}
+    )
 
 
 @app.exception_handler(MemoryNotFoundError)
@@ -78,7 +103,7 @@ async def internal_error(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
     try:
-        return await call_next(request)
+        response = await call_next(request)
     except Exception as exc:
         # Omit exception messages, local variables, and source lines which may contain secrets.
         frames = "".join(
@@ -86,9 +111,12 @@ async def internal_error(
             for frame, line in traceback.walk_tb(exc.__traceback__)
         )
         logger.error("Unhandled %s\n%s", type(exc).__name__, frames)
-        return JSONResponse(
+        response = JSONResponse(
             status_code=500, content={"detail": "Something went wrong. Please try again."}
         )
+    if request.url.path == "/api/media" or request.url.path.startswith("/api/media/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 app.add_middleware(
@@ -101,3 +129,4 @@ app.add_middleware(McpAuthGate)
 
 app.include_router(health.router)
 app.include_router(memories.router)
+app.include_router(media.router)
