@@ -535,6 +535,7 @@ def test_origin_host_cors_rate_limit_and_rest_routes(
         403,
         421,
     }
+    assert result(mcp.post("tools/list", headers={"Host": "127.0.0.1:8000"}))["tools"]
 
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=1))
     assert result(mcp.post("tools/list"))["tools"]

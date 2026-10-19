@@ -203,9 +203,15 @@ _base_url = urlsplit(settings.public_base_url)
 if not _base_url.scheme or not _base_url.netloc:
     raise ValueError("PUBLIC_BASE_URL must have a scheme and host")
 _public_origin = f"{_base_url.scheme}://{_base_url.netloc}"
+_allowed_hosts = [_base_url.netloc]
+_allowed_origins = [_public_origin, *settings.cors_origins]
+if "public_base_url" not in settings.model_fields_set:
+    # The default local URL also supports clients using the other loopback name.
+    _allowed_hosts.append("127.0.0.1:8000")
+    _allowed_origins.append("http://127.0.0.1:8000")
 _transport_security = TransportSecuritySettings(
-    allowed_hosts=[_base_url.netloc],
-    allowed_origins=list(dict.fromkeys([_public_origin, *settings.cors_origins])),
+    allowed_hosts=list(dict.fromkeys(_allowed_hosts)),
+    allowed_origins=list(dict.fromkeys(_allowed_origins)),
 )
 mcp_app = mcp.streamable_http_app(
     stateless_http=True,

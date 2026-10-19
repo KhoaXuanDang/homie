@@ -39,7 +39,10 @@ and MCP requests to 60, per process.
 to retain a session ID. Send a Cognito bearer access token and
 `Accept: application/json, text/event-stream`; after `initialize`, send
 `MCP-Protocol-Version: 2025-11-25` on subsequent requests. `PUBLIC_BASE_URL`
-and `CORS_ORIGINS` supply the allowed server host and browser origins.
+and `CORS_ORIGINS` supply the allowed server host and browser origins. When
+`PUBLIC_BASE_URL` is unset, local MCP requests may use either
+`localhost:8000` or `127.0.0.1:8000` as the Host. An explicitly configured
+`PUBLIC_BASE_URL` allows only its host.
 
 The endpoint exposes three tools:
 
