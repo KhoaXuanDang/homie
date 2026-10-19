@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from httpx import Response
 
 from app import main
+from app.middleware import auth as auth_middleware
 from app.middleware.auth import RateLimiter
 from app.services import memory_service
 from app.services.memory_service import MemoryService
@@ -160,10 +161,8 @@ def test_initialization_tool_schemas_and_endpoint_shape(mcp_client: tuple[McpCli
     assert set(recall_input["properties"]) == {"query", "kind"}
     assert recall_input["properties"]["query"]["type"] == "string"
     assert recall_input["properties"]["query"]["maxLength"] == 200
-    recall_kind, recall_null = recall_input["properties"]["kind"]["anyOf"]
-    assert recall_kind["type"] == "string"
-    assert set(recall_kind["enum"]) == kinds
-    assert recall_null["type"] == "null"
+    assert recall_input["properties"]["kind"]["type"] == "string"
+    assert set(recall_input["properties"]["kind"]["enum"]) == kinds
 
     forget_input = tools["forget"]["inputSchema"]
     assert forget_input["type"] == "object"
@@ -266,6 +265,26 @@ def test_json_looking_strings_stay_literal(mcp_client: tuple[McpClient, Any], li
     assert "event_id" not in recalled[0]
 
 
+@pytest.mark.parametrize("kind", [None, "null", "[]"])
+def test_explicit_null_or_json_looking_kind_is_invalid(
+    mcp_client: tuple[McpClient, Any], kind: Any
+) -> None:
+    mcp, _ = mcp_client
+    result(mcp.initialize())
+    assert tool_error(mcp.call("remember", {"content": "Do not save", "kind": kind}))
+    assert successful_content(mcp.call("recall", {"query": ""})) == {"memories": []}
+    assert tool_error(mcp.call("recall", {"query": "", "kind": kind}))
+
+
+@pytest.mark.parametrize("memory_id", [None, "null", "[]", "123"])
+def test_json_looking_memory_ids_are_rejected(
+    mcp_client: tuple[McpClient, Any], memory_id: Any
+) -> None:
+    mcp, _ = mcp_client
+    result(mcp.initialize())
+    assert tool_error(mcp.call("forget", {"memory_id": memory_id}))
+
+
 def test_recall_timestamp_defaults_to_utc_without_profile(
     mcp_client: tuple[McpClient, Any],
 ) -> None:
@@ -350,7 +369,35 @@ def test_http_auth_and_service_scope(mcp_client: tuple[McpClient, Any]) -> None:
         ("forget", {"memory_id": str(uuid4())}),
     ]:
         assert tool_error(mcp.call(name, arguments, token=service_token))
+    service_token_with_sub = mcp.token("alice", scope="homie/mcp:service")
+    assert tool_error(mcp.call("recall", {"query": ""}, token=service_token_with_sub)) == (
+        "A linked user account is required for memory tools."
+    )
     assert successful_content(mcp.call("recall", {"query": ""})) == {"memories": []}
+
+
+def test_mcp_tool_call_verifies_jwt_once(
+    mcp_client: tuple[McpClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp, _ = mcp_client
+    original_verify = auth_middleware.verify_token
+    count = 0
+
+    def counted_verify(token: str, required_scope: str | tuple[str, ...]) -> Any:
+        nonlocal count
+        count += 1
+        return original_verify(token, required_scope)
+
+    monkeypatch.setattr(auth_middleware, "verify_token", counted_verify)
+    for name, arguments in [
+        ("remember", {"content": "Verify once"}),
+        ("recall", {"query": "verify"}),
+        ("forget", {"memory_id": str(uuid4())}),
+    ]:
+        before = count
+        response = mcp.call(name, arguments)
+        assert response.status_code == 200
+        assert count == before + 1
 
 
 @pytest.mark.parametrize(
@@ -385,6 +432,34 @@ def test_forget_invalid_ids_and_storage_failure_are_safe(
     response = mcp.call("recall", {"query": "anything"})
     assert tool_error(response)
     assert "private-storage.example" not in response.text
+
+
+def test_expected_tool_errors_keep_exact_safe_text(mcp_client: tuple[McpClient, Any]) -> None:
+    mcp, _ = mcp_client
+    assert tool_error(mcp.call("forget", {"memory_id": "not-a-uuid"})) == (
+        "Please provide a valid memory ID."
+    )
+    assert tool_error(mcp.call("remember", {"content": "  "})) == (
+        "Please tell me what to remember."
+    )
+    assert tool_error(mcp.call("recall", {})) == (
+        "Please check the required tool arguments and their format."
+    )
+    assert tool_error(mcp.call("PRIVATE-UNKNOWN-TOOL", {})) == ("Unable to run that memory tool.")
+
+
+def test_unexpected_tool_errors_remain_generic(
+    mcp_client: tuple[McpClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp, _ = mcp_client
+
+    def crash(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("Private internal failure details")
+
+    monkeypatch.setattr(MemoryService, "recall", crash)
+    response = mcp.call("recall", {"query": "anything"})
+    assert tool_error(response) == "Error executing tool recall"
+    assert "Private internal failure details" not in response.text
 
 
 @pytest.mark.parametrize(

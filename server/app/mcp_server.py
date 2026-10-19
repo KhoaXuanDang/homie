@@ -1,22 +1,21 @@
 """Alexa-facing MCP tools backed by the authenticated memory service."""
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
 from urllib.parse import urlsplit
 from uuid import UUID
 
 from botocore.exceptions import BotoCoreError, ClientError
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import CallToolResult, InputRequiredResult
 from pydantic import BaseModel, ConfigDict, PlainValidator, ValidationError, WithJsonSchema
 
 from app.config import settings
-from app.middleware.auth import verify_token
 from app.models.memory import Kind, MemoryCreate
 from app.services.memory_service import MemoryService
 
-_KINDS = ("item_location", "fact", "preference", "todo")
+_KINDS = get_args(Kind)
 
 
 class ChangeResult(BaseModel):
@@ -43,20 +42,18 @@ class RecallResult(BaseModel):
 
 
 def _user_sub(ctx: Context) -> str:
-    authorization = (ctx.headers or {}).get("authorization", "")
-    scheme, separator, token = authorization.partition(" ")
-    if not separator or scheme.lower() != "bearer" or not token.strip() or " " in token.strip():
-        raise ToolError("A linked user account is required for memory tools.")
+    # McpAuthGate sets this only after verifying a linked-user token for this request.
     try:
-        user = verify_token(token.strip(), settings.mcp_tools_scope)
+        request = ctx.request_context.request
     except ValueError as exc:
         raise ToolError("A linked user account is required for memory tools.") from exc
-    if user.sub is None:
+    user_sub = getattr(getattr(request, "state", None), "user_sub", None)
+    if not isinstance(user_sub, str) or not user_sub:
         raise ToolError("A linked user account is required for memory tools.")
-    return user.sub
+    return user_sub
 
 
-def _storage_unavailable(exc: BotoCoreError | ClientError) -> ToolError:
+def _storage_unavailable() -> ToolError:
     return ToolError("Memory storage is unavailable. Please try again shortly.")
 
 
@@ -72,9 +69,17 @@ class MemoryMCPServer(MCPServer):
         try:
             return await super().call_tool(name, arguments, context)
         except ToolError as exc:
+            if isinstance(exc, UnexpectedToolError):
+                raise
             if isinstance(exc.__cause__, ValidationError):
-                raise ToolError("Please provide the required tool arguments.") from exc
-            raise
+                raise ToolError(
+                    "Please check the required tool arguments and their format."
+                ) from exc
+            if isinstance(exc.__cause__, ToolError) and not isinstance(
+                exc.__cause__, UnexpectedToolError
+            ):
+                raise ToolError(str(exc.__cause__)) from exc
+            raise ToolError("Unable to run that memory tool.") from exc
 
 
 mcp = MemoryMCPServer("homie")
@@ -88,7 +93,7 @@ def remember(
         PlainValidator(_preserve_literal),
         WithJsonSchema({"type": "string", "maxLength": 2000}),
     ],
-    kind: Annotated[Any, WithJsonSchema({"type": "string", "enum": list(_KINDS)})] = "fact",
+    kind: Annotated[str, WithJsonSchema({"type": "string", "enum": list(_KINDS)})] = "fact",
     tags: Annotated[
         Any,
         WithJsonSchema(
@@ -133,7 +138,7 @@ def remember(
             user_sub, data.content, data.kind, data.tags, data.event_id
         )
     except (BotoCoreError, ClientError) as exc:
-        raise _storage_unavailable(exc) from exc
+        raise _storage_unavailable() from exc
     return ChangeResult(status="success", memory_id=str(memory.id))
 
 
@@ -143,9 +148,7 @@ def recall(
     query: Annotated[
         str, PlainValidator(_preserve_literal), WithJsonSchema({"type": "string", "maxLength": 200})
     ],
-    kind: Annotated[
-        Any, WithJsonSchema({"anyOf": [{"type": "string", "enum": list(_KINDS)}, {"type": "null"}]})
-    ] = None,
+    kind: Annotated[str, WithJsonSchema({"type": "string", "enum": list(_KINDS)})] = None,
 ) -> RecallResult:
     """Find the linked user's memories, or list recent ones with a blank query."""
     user_sub = _user_sub(ctx)
@@ -159,7 +162,7 @@ def recall(
     try:
         memories = MemoryService().recall(user_sub, query, kind=kind, limit=10)
     except (BotoCoreError, ClientError) as exc:
-        raise _storage_unavailable(exc) from exc
+        raise _storage_unavailable() from exc
     return RecallResult(
         memories=[
             RecalledMemory(
@@ -177,7 +180,7 @@ def recall(
 @mcp.tool()
 def forget(
     ctx: Context,
-    memory_id: Annotated[Any, WithJsonSchema({"type": "string", "format": "uuid"})],
+    memory_id: Annotated[str, WithJsonSchema({"type": "string", "format": "uuid"})],
 ) -> ChangeResult:
     """Delete one of the linked user's memories by ID."""
     user_sub = _user_sub(ctx)
@@ -190,7 +193,7 @@ def forget(
     try:
         deleted = MemoryService().delete_memory(user_sub, parsed_id)
     except (BotoCoreError, ClientError) as exc:
-        raise _storage_unavailable(exc) from exc
+        raise _storage_unavailable() from exc
     if not deleted:
         raise ToolError("I couldn't find that memory.")
     return ChangeResult(status="success", memory_id=parsed_id)
