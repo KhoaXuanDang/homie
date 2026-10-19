@@ -67,6 +67,8 @@ in this phase. Memory bodies cannot override the profile timezone.
 
 Set `MEDIA_BUCKET` to the private S3 bucket provisioned by Terraform. Media routes
 use the same Cognito authentication and per-user isolation as memories.
+The server role needs S3 GetObject, PutObject, DeleteObject, and ListBucket
+(restricted to `users/*/media/` prefixes), plus access to the DynamoDB table.
 
 - `POST /api/media` accepts `{content_type, size, caption?}` and returns 201
   `{media, upload_url, upload_headers, expires_in}`. The media starts `pending`;
@@ -104,5 +106,9 @@ deletion, uploads less than one hour old retain a tombstone through that same
 abandonment window: a still-valid PUT or in-flight upload may otherwise recreate
 the object. Subsequent lists remove late objects and finally remove the tombstone
 once the window has elapsed. Neither markers nor tombstones are returned.
+List requests also reconcile objects older than one hour under that user's media
+prefix against strongly consistent media records, removing untracked objects.
+This catches a slow PUT that started before URL expiry but finished after its
+tombstone expired; S3 URL expiry does not bound an already-running upload.
 
 Run `uv run pytest`, `uv run ruff check .`, and `uv run ruff format --check .`.

@@ -1,7 +1,7 @@
 from collections.abc import Iterator
 from datetime import timedelta
 from typing import Any
-from uuid import uuid7
+from uuid import UUID, uuid7
 
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
@@ -180,6 +180,7 @@ class MediaService:
     def list_media(self, user_sub: str, limit: int = 50) -> list[Media]:
         limit = TypeAdapter(Limit).validate_python(limit)
         self.cleanup_pending(user_sub)
+        self._cleanup_orphans(user_sub)
         result = []
         for item in self._items(user_sub, FilterExpression=Attr("status").eq("uploaded")):
             result.append(self._to_media(item, user_sub))
@@ -281,3 +282,28 @@ class MediaService:
                 self._finish_delete(item)
                 deleted += 1
         return deleted
+
+    def _cleanup_orphans(self, user_sub: str) -> None:
+        prefix = f"users/{user_sub}/media/"
+        params = {"Bucket": settings.media_bucket, "Prefix": prefix, "MaxKeys": 200}
+        cutoff = utc_now() - timedelta(hours=1)
+        while True:
+            page = self._storage("list_objects_v2", **params)
+            for obj in page.get("Contents", []):
+                if obj["LastModified"] >= cutoff:
+                    continue
+                filename = obj["Key"][len(prefix) :]
+                try:
+                    media_id = str(UUID(filename.rsplit(".", 1)[0]))
+                except ValueError:
+                    continue
+                # A PUT authorized before expiry may finish after its tombstone is gone.
+                # UUIDs are server-generated and never reused; an absent record cannot
+                # later complete successfully, even if the object's PUT is still active.
+                if not self.table.get_item(
+                    Key=self._key(user_sub, media_id), ConsistentRead=True
+                ).get("Item"):
+                    self._storage("delete_object", Bucket=settings.media_bucket, Key=obj["Key"])
+            if not page.get("IsTruncated"):
+                break
+            params["ContinuationToken"] = page["NextContinuationToken"]

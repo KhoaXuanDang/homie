@@ -439,3 +439,44 @@ def test_delete_reconciles_late_upload(
     )
     assert media_service.cleanup_pending("alice") == 1
     assert "Item" not in media_service.table.get_item(Key=key)
+    # Model a PUT that started while authorized but finished after tombstone expiry.
+    media_service.s3.put_object(
+        Bucket=settings.media_bucket,
+        Key=f"users/alice/media/{media_id}.jpg",
+        Body=b"late",
+        ContentType="image/jpeg",
+    )
+    foreign_key = f"users/bob/media/{uuid4()}.jpg"
+    media_service.s3.put_object(Bucket=settings.media_bucket, Key=foreign_key, Body=b"private")
+    monkeypatch.setattr("app.services.media_service.utc_now", lambda: now + timedelta(hours=2))
+    assert media_client.get("/api/media", headers=auth()).json() == []
+    with pytest.raises(ClientError):
+        media_service.s3.head_object(
+            Bucket=settings.media_bucket, Key=f"users/alice/media/{media_id}.jpg"
+        )
+    assert (
+        media_service.s3.head_object(Bucket=settings.media_bucket, Key=foreign_key)["ContentLength"]
+        == 7
+    )
+
+
+def test_orphan_sweep_paginates_and_preserves_uploaded_media(
+    media_service: MediaService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = media_service.create_media("alice", MediaCreate(content_type="image/jpeg", size=4))
+    media_id = str(result.media.id)
+    item = upload(media_service, media_id)
+    media_service.complete_media("alice", media_id)
+    for _ in range(201):
+        media_service.s3.put_object(
+            Bucket=settings.media_bucket,
+            Key=f"users/alice/media/{uuid4()}.jpg",
+            Body=b"orphan",
+        )
+    later = datetime.now(UTC) + timedelta(hours=2)
+    monkeypatch.setattr("app.services.media_service.utc_now", lambda: later)
+    assert [str(media.id) for media in media_service.list_media("alice")] == [media_id]
+    remaining = media_service.s3.list_objects_v2(
+        Bucket=settings.media_bucket, Prefix="users/alice/media/"
+    )
+    assert [obj["Key"] for obj in remaining["Contents"]] == [item["s3_key"]]
