@@ -187,6 +187,22 @@ def test_idempotency_key_required_and_validated(client: TestClient, key: str | N
     assert response.status_code == 422
 
 
+def test_validation_error_openapi_matches_response(client: TestClient) -> None:
+    response = client.post("/api/memories", headers=auth(), json={})
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Invalid request fields."
+    assert response.json()["errors"]
+
+    schema = client.get("/openapi.json").json()["components"]["schemas"]
+    validation = schema["HTTPValidationError"]
+    assert validation["required"] == ["detail", "errors"]
+    assert validation["properties"]["detail"]["type"] == "string"
+    assert validation["properties"]["errors"]["type"] == "array"
+    error_schema = schema["ValidationError"]
+    assert error_schema["required"] == ["loc", "msg", "type"]
+    assert set(error_schema["properties"]) == {"loc", "msg", "type"}
+
+
 @pytest.mark.parametrize("method", ["get", "patch", "delete"])
 def test_api_user_isolation(client: TestClient, method: str) -> None:
     memory = client.post(

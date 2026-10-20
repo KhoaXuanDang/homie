@@ -23,11 +23,26 @@ export function useApi() {
   const token = auth.session?.accessToken
 
   return useMemo(() => {
-    const client = createClient<paths>({ baseUrl: env.apiUrl })
+    const client = createClient<paths>({
+      baseUrl: env.apiUrl,
+      async fetch(request) {
+        try {
+          return await fetch(request)
+        } catch (error) {
+          if (error instanceof TypeError) {
+            throw new ApiError(
+              0,
+              "You're offline. Check your connection and try again.",
+            )
+          }
+          throw error
+        }
+      },
+    })
 
     client.use({
       onRequest({ request }) {
-        if (!token) {
+        if (!token || !auth.isSessionTokenActive(token)) {
           window.dispatchEvent(new Event("homie:session-expired"))
           throw new ApiError(401, "Sign in again to continue.")
         }
@@ -36,6 +51,7 @@ export function useApi() {
       },
       onResponse({ response }) {
         if (response.status === 401) {
+          if (token) auth.invalidateSession(token)
           window.dispatchEvent(new Event("homie:session-expired"))
         }
         return response
@@ -43,5 +59,5 @@ export function useApi() {
     })
 
     return client
-  }, [token])
+  }, [auth, token])
 }

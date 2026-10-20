@@ -3,7 +3,7 @@
 import { useQueryClient } from "@tanstack/react-query"
 import { WebStorageStateStore } from "oidc-client-ts"
 import { useRouter } from "next/navigation"
-import { createContext, use, useMemo, useState } from "react"
+import { createContext, use, useMemo, useRef, useState } from "react"
 import {
   AuthProvider as OidcProvider,
   useAuth as useOidc,
@@ -25,6 +25,9 @@ type Auth = {
   /** Sends the user to Cognito's Hosted UI (sign-in and sign-up). */
   signIn: () => Promise<void>
   signOut: () => Promise<void>
+  /** Blocks a rejected access token and removes it from persistent auth storage. */
+  invalidateSession: (accessToken: string) => void
+  isSessionTokenActive: (accessToken: string) => boolean
 }
 
 // Cognito Hosted UI with authorization code + PKCE (plan Task 9). NEXT_PUBLIC_*
@@ -65,22 +68,29 @@ function SessionBridge({ children }: { children: React.ReactNode }) {
   const oidc = useOidc()
   const queryClient = useQueryClient()
   const [signingOut, setSigningOut] = useState(false)
+  const [invalidatedTokens, setInvalidatedTokens] = useState<Set<string>>(
+    () => new Set(),
+  )
+  const invalidatedTokensRef = useRef(new Set<string>())
   const user = oidc.user && !oidc.user.expired ? oidc.user : null
 
   const value = useMemo<Auth>(
     () => ({
       loading: oidc.isLoading,
-      session: user && {
-        accessToken: user.access_token,
-        user: {
-          sub: user.profile.sub,
-          email: user.profile.email ?? "",
-          name:
-            user.profile.name ??
-            user.profile.email?.split("@")[0] ??
-            "Homie user",
-        },
-      },
+      session:
+        user && !invalidatedTokens.has(user.access_token)
+          ? {
+              accessToken: user.access_token,
+              user: {
+                sub: user.profile.sub,
+                email: user.profile.email ?? "",
+                name:
+                  user.profile.name ??
+                  user.profile.email?.split("@")[0] ??
+                  "Homie user",
+              },
+            }
+          : null,
       error: oidc.error
         ? "Couldn't sign you in. Check your connection and try again."
         : null,
@@ -88,6 +98,16 @@ function SessionBridge({ children }: { children: React.ReactNode }) {
       signIn: async () => {
         await oidc.signinRedirect()
       },
+      invalidateSession: (accessToken) => {
+        if (invalidatedTokensRef.current.has(accessToken)) return
+        invalidatedTokensRef.current.add(accessToken)
+        setInvalidatedTokens((current) => new Set(current).add(accessToken))
+        if (oidc.user?.access_token === accessToken) {
+          void oidc.removeUser().catch(() => undefined)
+        }
+      },
+      isSessionTokenActive: (accessToken) =>
+        !invalidatedTokensRef.current.has(accessToken),
       signOut: async () => {
         if (
           !window.confirm("Sign out of Homie? Any unsaved work will be lost.")
@@ -109,7 +129,7 @@ function SessionBridge({ children }: { children: React.ReactNode }) {
         }
       },
     }),
-    [oidc, user, queryClient, signingOut],
+    [oidc, user, queryClient, signingOut, invalidatedTokens],
   )
 
   return <AuthContext value={value}>{children}</AuthContext>

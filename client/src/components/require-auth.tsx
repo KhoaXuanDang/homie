@@ -2,26 +2,45 @@
 
 import { useRouter } from "next/navigation"
 import { useEffect, useState } from "react"
+import { useQueryClient } from "@tanstack/react-query"
 
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/lib/auth"
 
 export function RequireAuth({ children }: { children: React.ReactNode }) {
   const { loading, session, signingOut } = useAuth()
+  const queryClient = useQueryClient()
   const router = useRouter()
   const [lastSub, setLastSub] = useState<string | null>(
     session?.user.sub ?? null,
   )
+  const currentSub = session?.user.sub ?? null
+  const accountChanged = currentSub !== null && currentSub !== lastSub
 
-  if (session && session.user.sub !== lastSub) {
-    setLastSub(session.user.sub)
-  }
+  useEffect(() => {
+    if (!accountChanged || !currentSub) return
+    let cancelled = false
+    const clearPreviousAccount = async () => {
+      try {
+        await queryClient.cancelQueries()
+      } catch {
+        // Clearing the cache still matters if a query cancellation rejects.
+      } finally {
+        queryClient.clear()
+        if (!cancelled) setLastSub(currentSub)
+      }
+    }
+    void clearPreviousAccount()
+    return () => {
+      cancelled = true
+    }
+  }, [accountChanged, currentSub, queryClient])
 
   useEffect(() => {
     if (signingOut || (!loading && !session && !lastSub)) router.replace("/")
   }, [loading, session, lastSub, router, signingOut])
 
-  if (signingOut || (!session && !lastSub)) {
+  if (signingOut || accountChanged || (!session && !lastSub)) {
     return (
       <div className="flex min-h-dvh" aria-busy="true">
         <span className="sr-only">Loading…</span>

@@ -65,7 +65,9 @@ export interface components {
     /** HTTPValidationError */
     HTTPValidationError: {
       /** Detail */
-      detail?: components["schemas"]["ValidationError"][]
+      detail: string
+      /** Errors */
+      errors: components["schemas"]["ValidationError"][]
     }
     /** Memory */
     Memory: {
@@ -138,10 +140,6 @@ export interface components {
       msg: string
       /** Error Type */
       type: string
-      /** Input */
-      input?: unknown
-      /** Context */
-      ctx?: Record<string, never>
     }
   }
   responses: never
