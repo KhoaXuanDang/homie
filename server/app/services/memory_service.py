@@ -242,14 +242,6 @@ class MemoryService:
         }
 
     @classmethod
-    def _rank(cls, memories: list[Memory], query: str) -> list[Memory]:
-        return cls._rank_items(
-            memories,
-            query,
-            lambda memory: f"{memory.content} {' '.join(memory.tags)}",
-        )
-
-    @classmethod
     def _rank_records(cls, records: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
         return cls._rank_items(
             records,
@@ -348,12 +340,18 @@ class MemoryService:
         if kind is not None:
             _kind_adapter.validate_python(kind)
 
-        memories = self.list_memories(user_sub, kind=kind, limit=200)
-        if query and query.strip():
-            ranked = self._rank(memories, query.strip())
+        result_limit = min(limit, 10)
+        search_query = query.strip()
+        records = self._read_memory_records(
+            user_sub, limit=result_limit if kind is None and not search_query else None
+        )
+        if kind is not None:
+            records = [record for record in records if record["kind"] == kind]
+        if search_query:
+            ranked = self._rank_records(records, search_query)
             if ranked:
-                return ranked[: min(limit, 10)]
-        return memories[: min(limit, 10)]
+                records = ranked
+        return self._to_memories(user_sub, records[:result_limit])
 
     def update_memory(self, user_sub: str, memory_id: str, **updates: Any) -> Memory:
         user_sub = self._validate_sub(user_sub)

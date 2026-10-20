@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from app.config import settings
+from app.mcp_server import mcp, mcp_app
 from app.middleware.auth import McpAuthGate, RateLimiter
 from app.routes import health, memories
 from app.services.memory_service import (
@@ -27,7 +28,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.dynamodb_endpoint_url:
         ensure_table()
-    yield
+    async with mcp.session_manager.run():
+        yield
 
 
 app = FastAPI(title="Homie API", lifespan=lifespan)
@@ -91,13 +93,14 @@ async def internal_error(
         )
 
 
+app.add_middleware(McpAuthGate)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(McpAuthGate)
 
 app.include_router(health.router)
 app.include_router(memories.router)
+app.add_route("/mcp", mcp_app, methods=["GET", "POST", "DELETE"])
