@@ -48,8 +48,39 @@ def auth(user_sub: str = "alice", **overrides: object) -> dict[str, str]:
     }
 
 
+def mcp_request(
+    client: TestClient,
+    headers: dict[str, str],
+    method: str,
+    params: dict[str, object],
+) -> httpx.Response:
+    return client.post(
+        "/mcp",
+        headers={
+            **headers,
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2025-11-25",
+        },
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+    )
+
+
+def mcp_initialize(client: TestClient, headers: dict[str, str]) -> httpx.Response:
+    return mcp_request(
+        client,
+        headers,
+        "initialize",
+        {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "memory-api-tests", "version": "1.0"},
+        },
+    )
+
+
 @pytest.fixture
 def client(
+    app_client: TestClient,
     ddb_table: str,
     monkeypatch: pytest.MonkeyPatch,
     fake_jwks_endpoint: str,
@@ -61,11 +92,10 @@ def client(
     monkeypatch.setattr(main.app.state, "api_rate_limiter", RateLimiter(max_requests=120))
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=60))
     main.app.dependency_overrides[get_memory_service] = lambda: MemoryService(table=ddb_table)
-    with TestClient(main.app) as client:
-        try:
-            yield client
-        finally:
-            main.app.dependency_overrides.pop(get_memory_service, None)
+    try:
+        yield app_client
+    finally:
+        main.app.dependency_overrides.pop(get_memory_service, None)
 
 
 def test_api_crud(client: TestClient) -> None:
@@ -291,47 +321,36 @@ def test_mcp_auth_gate_requires_service_scope_and_has_its_own_limiter(
 ) -> None:
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=1))
     service_token = auth(scope="homie/mcp:service", sub=None)
-    response = client.get("/mcp", headers=service_token)
-    # Valid credentials pass the gate; the MCP route is not registered yet.
-    assert response.status_code == 404
+    response = mcp_initialize(client, service_token)
+    assert response.status_code == 200
 
-    limited = client.get("/mcp", headers=service_token)
+    limited = mcp_initialize(client, service_token)
     assert limited.status_code == 429
     assert limited.headers["Retry-After"] == "60"
 
     # Linked-user tokens are also accepted and use their own user rate-limit partition.
-    tools_only = client.get("/mcp", headers=auth(scope="homie/mcp:tools"))
-    assert tools_only.status_code == 404
-    tools_limited = client.get("/mcp", headers=auth(scope="homie/mcp:tools"))
+    tools_only = mcp_initialize(client, auth(scope="homie/mcp:tools"))
+    assert tools_only.status_code == 200
+    tools_limited = mcp_initialize(client, auth(scope="homie/mcp:tools"))
     assert tools_limited.status_code == 429
 
     # The separate API limiter remains unaffected by MCP requests.
     assert client.get("/api/memories", headers=auth()).status_code == 200
 
 
-def test_mcp_gate_only_attaches_user_sub_for_linked_user_tokens(
-    client: TestClient,
-) -> None:
-    from starlette.requests import Request
+def test_mcp_gate_accepts_service_and_linked_user_tokens(client: TestClient) -> None:
+    for headers in (auth(scope="homie/mcp:service", sub=None), auth(scope="homie/mcp:tools")):
+        initialized = mcp_initialize(client, headers)
+        assert initialized.status_code == 200
+        assert initialized.json()["result"]["protocolVersion"] == "2025-11-25"
 
-    async def probe_mcp(request: Request) -> dict[str, str | None]:
-        return {"user_sub": getattr(request.state, "user_sub", None)}
-
-    main.app.add_api_route("/mcp", probe_mcp, methods=["GET"], include_in_schema=False)
-    try:
-        service_response = client.get("/mcp", headers=auth(scope="homie/mcp:service", sub=None))
-        assert service_response.status_code == 200
-        assert service_response.json() == {"user_sub": None}
-
-        linked_user_response = client.get("/mcp", headers=auth(scope="homie/mcp:tools"))
-        assert linked_user_response.status_code == 200
-        assert linked_user_response.json() == {"user_sub": "alice"}
-    finally:
-        main.app.router.routes[:] = [
-            route
-            for route in main.app.router.routes
-            if getattr(route, "endpoint", None) is not probe_mcp
-        ]
+        listed = mcp_request(client, headers, "tools/list", {})
+        assert listed.status_code == 200
+        assert {tool["name"] for tool in listed.json()["result"]["tools"]} == {
+            "remember",
+            "recall",
+            "forget",
+        }
 
 
 def test_jwks_refresh_http_error_uses_stale_cached_keys(
