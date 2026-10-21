@@ -1,0 +1,5 @@
+:80 {
+	@api path /api/* /mcp /mcp/* /health /health/*
+	reverse_proxy @api server:8000
+	reverse_proxy client:3000
+}
