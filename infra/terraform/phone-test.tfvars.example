@@ -1,0 +1,6 @@
+# Replace with the stable HTTPS hostname configured for the named Cloudflare Tunnel.
+# Include localhost only if desktop development also needs to sign in.
+dashboard_urls = [
+  "http://localhost:3000",
+  "https://homie-demo.example.com",
+]

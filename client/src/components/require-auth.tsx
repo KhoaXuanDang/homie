@@ -1,20 +1,46 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { useEffect } from "react"
+import { useEffect, useState } from "react"
+import { useQueryClient } from "@tanstack/react-query"
 
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/lib/auth"
 
 export function RequireAuth({ children }: { children: React.ReactNode }) {
-  const { loading, session } = useAuth()
+  const { loading, session, signingOut } = useAuth()
+  const queryClient = useQueryClient()
   const router = useRouter()
+  const [lastSub, setLastSub] = useState<string | null>(
+    session?.user.sub ?? null,
+  )
+  const currentSub = session?.user.sub ?? null
+  const accountChanged = currentSub !== null && currentSub !== lastSub
 
   useEffect(() => {
-    if (!loading && !session) router.replace("/")
-  }, [loading, session, router])
+    if (!accountChanged || !currentSub) return
+    let cancelled = false
+    const clearPreviousAccount = async () => {
+      try {
+        await queryClient.cancelQueries()
+      } catch {
+        // Clearing the cache still matters if a query cancellation rejects.
+      } finally {
+        queryClient.clear()
+        if (!cancelled) setLastSub(currentSub)
+      }
+    }
+    void clearPreviousAccount()
+    return () => {
+      cancelled = true
+    }
+  }, [accountChanged, currentSub, queryClient])
 
-  if (!session) {
+  useEffect(() => {
+    if (signingOut || (!loading && !session && !lastSub)) router.replace("/")
+  }, [loading, session, lastSub, router, signingOut])
+
+  if (signingOut || accountChanged || (!session && !lastSub)) {
     return (
       <div className="flex min-h-dvh" aria-busy="true">
         <span className="sr-only">Loading…</span>
@@ -27,5 +53,8 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
       </div>
     )
   }
-  return children
+
+  // Keep the protected subtree mounted through token recovery; its API hooks
+  // still see the current (possibly null) session and must gate requests.
+  return <div key={session?.user.sub ?? lastSub}>{children}</div>
 }

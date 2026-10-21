@@ -13,11 +13,18 @@ from zoneinfo import ZoneInfo
 import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError, EndpointConnectionError
-from pydantic import TypeAdapter, ValidationError
+from pydantic import TypeAdapter
 
 from app.config import settings
 from app.models.memory import Kind, Limit, Memory, MemoryCreate, MemoryUpdate
-from app.models.user import Profile, UserSub
+from app.models.user import UserSub
+from app.services.storage import (
+    memory_media_ids,
+    parse_utc,
+    profile_timezone,
+    storage_errors,
+    utc_timestamp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +102,8 @@ def ensure_table(attempts: int = 10, delay: float = 1.0) -> None:
             time.sleep(delay)
 
 
-def _parse_utc(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value)
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
 class MemoryService:
+    @storage_errors
     def __init__(self, table: Any = None) -> None:
         self.table = table if table is not None else get_table()
 
@@ -108,13 +111,7 @@ class MemoryService:
         return _user_sub_adapter.validate_python(user_sub)
 
     def _timezone(self, user_sub: str) -> tuple[str, ZoneInfo]:
-        item = self.table.get_item(Key={"pk": f"USER#{user_sub}", "sk": "PROFILE"}).get("Item")
-        try:
-            tz_name = Profile(timezone=item["timezone"]).timezone if item else "UTC"
-        except KeyError, ValidationError:
-            logger.warning("Invalid stored profile timezone; using UTC")
-            tz_name = "UTC"
-        return tz_name, ZoneInfo(tz_name)
+        return profile_timezone(self.table, user_sub)
 
     @staticmethod
     def _to_memory(record: dict[str, Any], timezone: str, zone: ZoneInfo) -> Memory:
@@ -126,11 +123,12 @@ class MemoryService:
             tags=list(record.get("tags", [])),
             event_id=record.get("event_id"),
             media_ids=list(record.get("media_ids", [])),
-            created_at=_parse_utc(record["created_at"]).astimezone(zone),
-            updated_at=_parse_utc(record["updated_at"]).astimezone(zone),
+            created_at=parse_utc(record["created_at"]).astimezone(zone),
+            updated_at=parse_utc(record["updated_at"]).astimezone(zone),
             timezone=timezone,
         )
 
+    @storage_errors
     def create_memory(
         self,
         user_sub: str,
@@ -144,7 +142,7 @@ class MemoryService:
         data = MemoryCreate(content=content, kind=kind, tags=tags, event_id=event_id)
         # A missing PROFILE means defaults (UTC); profiles are created by the profile endpoint.
         memory_id = str(uuid.uuid7())
-        now_iso = utc_now().isoformat()
+        now_iso = utc_timestamp(utc_now())
         item = {
             "pk": f"USER#{user_sub}",
             "sk": f"MEM#{memory_id}",
@@ -153,7 +151,6 @@ class MemoryService:
             "content": data.content,
             "kind": data.kind,
             "tags": data.tags,
-            "media_ids": [],
             "created_at": now_iso,
             "updated_at": now_iso,
         }
@@ -198,6 +195,16 @@ class MemoryService:
                     ]
                 )
             except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
+                    raise
+                reasons = exc.response.get("CancellationReasons", [])
+                if not any(
+                    reason.get("Code") == "ConditionalCheckFailed" for reason in reasons
+                ) or any(
+                    reason.get("Code") not in {"None", "ConditionalCheckFailed"}
+                    for reason in reasons
+                ):
+                    raise
                 # Only treat a failed transaction as a replay if its request record now exists.
                 existing = self.table.get_item(
                     Key={"pk": request_item["pk"], "sk": request_sk}, ConsistentRead=True
@@ -206,9 +213,7 @@ class MemoryService:
                     return self._resolve_idempotent_replay(
                         user_sub, existing, request_item["payload_hash"]
                     )
-                if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
-                    raise IdempotencyInProgressError("Request in progress, try again") from exc
-                raise
+                raise IdempotencyInProgressError("Request in progress, try again") from exc
         else:
             self.table.put_item(Item=item)
         return self._to_memory(item, *self._timezone(user_sub))
@@ -231,7 +236,7 @@ class MemoryService:
         if item is None:
             raise IdempotencyRecordDeletedError("The memory created by this request was deleted")
         # P0 intentionally replays the memory's latest state, even if it changed after creation.
-        return self._to_memory(item, *self._timezone(user_sub))
+        return self._to_memories(user_sub, [item])[0]
 
     @staticmethod
     def _tokens(text: str) -> set[str]:
@@ -240,14 +245,6 @@ class MemoryService:
             for word in re.findall(r"[a-z0-9]+", text.lower())
             if word not in _STOPWORDS
         }
-
-    @classmethod
-    def _rank(cls, memories: list[Memory], query: str) -> list[Memory]:
-        return cls._rank_items(
-            memories,
-            query,
-            lambda memory: f"{memory.content} {' '.join(memory.tags)}",
-        )
 
     @classmethod
     def _rank_records(cls, records: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
@@ -271,15 +268,18 @@ class MemoryService:
             if score
         ]
 
+    @storage_errors
     def get_memory(self, user_sub: str, memory_id: str) -> Memory:
         user_sub = self._validate_sub(user_sub)
         if not memory_id:
             raise MemoryNotFoundError("Memory not found")
-        response = self.table.get_item(Key={"pk": f"USER#{user_sub}", "sk": f"MEM#{memory_id}"})
+        response = self.table.get_item(
+            Key={"pk": f"USER#{user_sub}", "sk": f"MEM#{memory_id}"}, ConsistentRead=True
+        )
         item = response.get("Item")
         if not item:
             raise MemoryNotFoundError("Memory not found")
-        return self._to_memory(item, *self._timezone(user_sub))
+        return self._to_memories(user_sub, [item])[0]
 
     def _read_memory_records(
         self, user_sub: str, *, limit: int | None = None
@@ -316,8 +316,13 @@ class MemoryService:
         if not records:
             return []
         timezone, zone = self._timezone(user_sub)
-        return [self._to_memory(record, timezone, zone) for record in records]
+        links = memory_media_ids(self.table, user_sub, {record["id"] for record in records})
+        return [
+            self._to_memory({**record, "media_ids": links[record["id"]]}, timezone, zone)
+            for record in records
+        ]
 
+    @storage_errors
     def list_memories(
         self,
         user_sub: str,
@@ -340,6 +345,7 @@ class MemoryService:
             records = self._rank_records(records, query.strip())
         return self._to_memories(user_sub, records[:limit])
 
+    @storage_errors
     def recall(
         self, user_sub: str, query: str, kind: Kind | None = None, limit: int = 10
     ) -> list[Memory]:
@@ -348,13 +354,20 @@ class MemoryService:
         if kind is not None:
             _kind_adapter.validate_python(kind)
 
-        memories = self.list_memories(user_sub, kind=kind, limit=200)
-        if query and query.strip():
-            ranked = self._rank(memories, query.strip())
+        result_limit = min(limit, 10)
+        search_query = query.strip()
+        records = self._read_memory_records(
+            user_sub, limit=result_limit if kind is None and not search_query else None
+        )
+        if kind is not None:
+            records = [record for record in records if record["kind"] == kind]
+        if search_query:
+            ranked = self._rank_records(records, search_query)
             if ranked:
-                return ranked[: min(limit, 10)]
-        return memories[: min(limit, 10)]
+                records = ranked
+        return self._to_memories(user_sub, records[:result_limit])
 
+    @storage_errors
     def update_memory(self, user_sub: str, memory_id: str, **updates: Any) -> Memory:
         user_sub = self._validate_sub(user_sub)
         data = MemoryUpdate.model_validate(updates)
@@ -375,7 +388,7 @@ class MemoryService:
                 removes.append("event_id")
             else:
                 sets["event_id"] = changes["event_id"]
-        sets["updated_at"] = utc_now().isoformat()
+        sets["updated_at"] = utc_timestamp(utc_now())
         expression = "SET " + ", ".join(f"#{k} = :{k}" for k in sets)
         if removes:
             expression += " REMOVE " + ", ".join(f"#{key}" for key in removes)
@@ -393,8 +406,9 @@ class MemoryService:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 raise MemoryNotFoundError("Memory not found") from exc
             raise
-        return self._to_memory(response["Attributes"], *self._timezone(user_sub))
+        return self._to_memories(user_sub, [response["Attributes"]])[0]
 
+    @storage_errors
     def delete_memory(self, user_sub: str, memory_id: str) -> bool:
         user_sub = self._validate_sub(user_sub)
         if not memory_id:

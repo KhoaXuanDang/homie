@@ -1,30 +1,15 @@
 "use client"
 
-import {
-  Brain,
-  CalendarDays,
-  HouseHeart,
-  Images,
-  LogOut,
-  MessageCircle,
-  Settings,
-} from "lucide-react"
+import { Brain, HouseHeart, LogOut, Settings } from "lucide-react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
+import { toast } from "sonner"
 
 import { initials, useAuth } from "@/lib/auth"
 import { cn } from "@/lib/utils"
 
 const NAV = [
   { href: "/memories", label: "Memories", short: "Memories", icon: Brain },
-  {
-    href: "/calendar",
-    label: "Calendar",
-    short: "Calendar",
-    icon: CalendarDays,
-  },
-  { href: "/media", label: "Media", short: "Media", icon: Images },
-  { href: "/simulator", label: "Simulator", short: "Sim", icon: MessageCircle },
   { href: "/settings", label: "Settings", short: "Settings", icon: Settings },
 ]
 
@@ -32,6 +17,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
   const { session, signOut } = useAuth()
   const user = session?.user
+  const handleSignOut = () => {
+    void signOut().catch(() =>
+      toast.error("Couldn't sign out. Please try again."),
+    )
+  }
   const links = NAV.map((item) => ({
     ...item,
     active: pathname.startsWith(item.href),
@@ -92,7 +82,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
             <button
               type="button"
-              onClick={signOut}
+              onClick={handleSignOut}
               aria-label="Sign out"
               className="focus-visible:ring-sidebar-ring grid size-11 place-items-center rounded-lg text-[#afc2b7] outline-none hover:text-white focus-visible:ring-2"
             >

@@ -1,7 +1,8 @@
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid7
+from zoneinfo import ZoneInfo
 
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
@@ -15,14 +16,22 @@ from app.models.memory import Limit
 from app.models.user import UserSub
 from app.services.memory_service import (
     MemoryNotFoundError,
-    MemoryService,
-    _parse_utc,
     get_table,
     utc_now,
+)
+from app.services.storage import (
+    StorageError,
+    existing_keys,
+    parse_utc,
+    profile_timezone,
+    storage_errors,
+    utc_timestamp,
 )
 
 UPLOAD_EXPIRY = 300
 VIEW_EXPIRY = 900
+_user_sub_adapter = TypeAdapter(UserSub)
+_limit_adapter = TypeAdapter(Limit)
 _EXTENSIONS = {
     "image/jpeg": "jpg",
     "image/png": "png",
@@ -41,11 +50,11 @@ class UploadNotReadyError(Exception):
     pass
 
 
-class MediaStorageError(Exception):
-    pass
+MediaStorageError = StorageError
 
 
 class MediaService:
+    @storage_errors
     def __init__(self, table: Any = None, s3: Any = None) -> None:
         self.table = table if table is not None else get_table()
         self.s3 = (
@@ -65,7 +74,7 @@ class MediaService:
 
     @staticmethod
     def _key(user_sub: str, media_id: str) -> dict[str, str]:
-        sub = TypeAdapter(UserSub).validate_python(user_sub)
+        sub = _user_sub_adapter.validate_python(user_sub)
         return {"pk": f"USER#{sub}", "sk": f"MEDIA#{media_id}"}
 
     def _storage(self, operation: str, **kwargs: Any) -> Any:
@@ -86,15 +95,36 @@ class MediaService:
             "generate_presigned_url", ClientMethod=operation, Params=params, ExpiresIn=expiry
         )
 
-    def _to_media(self, item: dict[str, Any], user_sub: str) -> Media:
-        _, zone = MemoryService(table=self.table)._timezone(user_sub)
+    def _to_media(self, item: dict[str, Any], zone: ZoneInfo) -> Media:
         return Media(
             **{key: value for key, value in item.items() if key != "created_at"},
-            created_at=_parse_utc(item["created_at"]).astimezone(zone),
+            created_at=parse_utc(item["created_at"]).astimezone(zone),
             url=self._presign("get_object", item, VIEW_EXPIRY)
             if item["status"] == "uploaded"
             else "",
         )
+
+    def _to_medias(self, items: list[dict[str, Any]], user_sub: str) -> list[Media]:
+        user_sub = _user_sub_adapter.validate_python(user_sub)
+        _, zone = profile_timezone(self.table, user_sub)
+        memory_keys = [
+            {"pk": self._key(user_sub, "")["pk"], "sk": f"MEM#{item['memory_id']}"}
+            for item in items
+            if item.get("memory_id")
+        ]
+        existing = existing_keys(self.table, memory_keys)
+        return [
+            self._to_media(
+                {
+                    **item,
+                    "memory_id": item.get("memory_id")
+                    if f"MEM#{item.get('memory_id')}" in existing
+                    else None,
+                },
+                zone,
+            )
+            for item in items
+        ]
 
     def _get(self, user_sub: str, media_id: str) -> dict[str, Any]:
         item = self.table.get_item(Key=self._key(user_sub, media_id), ConsistentRead=True).get(
@@ -104,7 +134,9 @@ class MediaService:
             raise MediaNotFoundError
         return item
 
+    @storage_errors
     def create_media(self, user_sub: str, data: MediaCreate) -> MediaUpload:
+        user_sub = _user_sub_adapter.validate_python(user_sub)
         media_id = str(uuid7())
         key = self._key(user_sub, media_id)
         item = {
@@ -115,12 +147,12 @@ class MediaService:
             "tags": [],
             "training_consent": False,
             "status": "pending",
-            "created_at": utc_now().isoformat(),
+            "created_at": utc_timestamp(utc_now()),
         }
         upload_url = self._presign("put_object", item, UPLOAD_EXPIRY)
         self.table.put_item(Item=item, ConditionExpression="attribute_not_exists(pk)")
         return MediaUpload(
-            media=self._to_media(item, user_sub),
+            media=self._to_medias([item], user_sub)[0],
             upload_url=upload_url,
             upload_headers={
                 "Content-Type": data.content_type,
@@ -129,10 +161,11 @@ class MediaService:
             expires_in=UPLOAD_EXPIRY,
         )
 
+    @storage_errors
     def complete_media(self, user_sub: str, media_id: str) -> Media:
         item = self._get(user_sub, media_id)
         if item["status"] == "uploaded":
-            return self._to_media(item, user_sub)
+            return self._to_medias([item], user_sub)[0]
         try:
             head = self._storage("head_object", Bucket=settings.media_bucket, Key=item["s3_key"])
         except MediaStorageError as exc:
@@ -159,7 +192,7 @@ class MediaService:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 raise MediaNotFoundError from exc
             raise
-        return self._to_media(item, user_sub)
+        return self._to_medias([item], user_sub)[0]
 
     def _items(self, user_sub: str, **kwargs: Any) -> Iterator[dict[str, Any]]:
         params = {
@@ -177,30 +210,24 @@ class MediaService:
                 break
             params["ExclusiveStartKey"] = page["LastEvaluatedKey"]
 
+    @storage_errors
     def list_media(self, user_sub: str, limit: int = 50) -> list[Media]:
-        limit = TypeAdapter(Limit).validate_python(limit)
-        self.cleanup_pending(user_sub)
-        self._cleanup_orphans(user_sub)
+        limit = _limit_adapter.validate_python(limit)
         result = []
         for item in self._items(user_sub, FilterExpression=Attr("status").eq("uploaded")):
-            result.append(self._to_media(item, user_sub))
+            result.append(item)
             if len(result) == limit:
                 break
-        return result
+        return self._to_medias(result, user_sub)
 
+    @storage_errors
     def update_media(self, user_sub: str, media_id: str, data: MediaUpdate) -> Media:
         self._get(user_sub, media_id)
-        if data.memory_id is not None:
-            if not self.table.get_item(
-                Key={"pk": self._key(user_sub, "")["pk"], "sk": f"MEM#{data.memory_id}"},
-                ConsistentRead=True,
-            ).get("Item"):
-                raise MemoryNotFoundError
         changes = data.model_dump(mode="json", exclude_unset=True)
         names = {f"#f{i}": field for i, field in enumerate(changes)}
         values = {f":v{i}": value for i, value in enumerate(changes.values())}
         try:
-            item = self.table.update_item(
+            update = dict(
                 Key=self._key(user_sub, media_id),
                 UpdateExpression="SET " + ", ".join(f"#f{i} = :v{i}" for i in range(len(changes))),
                 ConditionExpression="#status IN (:pending, :uploaded)",
@@ -210,20 +237,56 @@ class MediaService:
                     ":pending": "pending",
                     ":uploaded": "uploaded",
                 },
-                ReturnValues="ALL_NEW",
-            )["Attributes"]
+            )
+            if data.memory_id is not None:
+                self.table.meta.client.transact_write_items(
+                    TransactItems=[
+                        {
+                            "ConditionCheck": {
+                                "TableName": self.table.name,
+                                "Key": {
+                                    "pk": self._key(user_sub, "")["pk"],
+                                    "sk": f"MEM#{data.memory_id}",
+                                },
+                                "ConditionExpression": "attribute_exists(pk)",
+                            }
+                        },
+                        {"Update": {"TableName": self.table.name, **update}},
+                    ]
+                )
+                item = self._get(user_sub, media_id)
+            else:
+                item = self.table.update_item(**update, ReturnValues="ALL_NEW")["Attributes"]
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 raise MediaNotFoundError from exc
+            if exc.response["Error"]["Code"] == "TransactionCanceledException":
+                reasons = exc.response.get("CancellationReasons", [])
+                if any(
+                    reason.get("Code") not in {"None", "ConditionalCheckFailed"}
+                    for reason in reasons
+                ):
+                    raise
+                if reasons and reasons[0].get("Code") == "ConditionalCheckFailed":
+                    raise MemoryNotFoundError from exc
+                if len(reasons) > 1 and reasons[1].get("Code") == "ConditionalCheckFailed":
+                    raise MediaNotFoundError from exc
             raise
-        return self._to_media(item, user_sub)
+        return self._to_medias([item], user_sub)[0]
 
-    def _claim_delete(self, item: dict[str, Any], *, cutoff: str | None = None) -> bool:
-        condition = "attribute_exists(pk)"
-        values: dict[str, Any] = {":deleting": "deleting"}
+    def _claim_delete(self, item: dict[str, Any], *, cutoff: datetime | None = None) -> bool:
+        condition = "#status IN (:pending, :uploaded)"
+        values: dict[str, Any] = {
+            ":deleting": "deleting",
+            ":pending": "pending",
+            ":uploaded": "uploaded",
+        }
         if cutoff is not None:
-            condition = "#status = :pending AND created_at < :cutoff"
-            values.update({":pending": "pending", ":cutoff": cutoff})
+            if parse_utc(item["created_at"]) >= cutoff:
+                return False
+            condition = "#status = :pending AND created_at = :snapshot"
+            values.pop(":uploaded")
+            values[":snapshot"] = item["created_at"]
         try:
             self.table.update_item(
                 Key={"pk": item["pk"], "sk": item["sk"]},
@@ -239,18 +302,25 @@ class MediaService:
         return True
 
     def _finish_delete(self, item: dict[str, Any]) -> None:
-        # Keep the deletion marker until S3 succeeds, so a later list/delete can retry.
+        # Failed removals remain retryable; fresh completed markers need no S3 work.
+        if item.get("deletion_complete") and parse_utc(item["created_at"]) >= utc_now() - timedelta(
+            hours=1
+        ):
+            return
         self._storage("delete_object", Bucket=settings.media_bucket, Key=item["s3_key"])
         try:
             params = {
                 "Key": {"pk": item["pk"], "sk": item["sk"]},
-                "ConditionExpression": "#status = :deleting",
+                "ConditionExpression": "#status = :deleting AND created_at = :snapshot",
                 "ExpressionAttributeNames": {"#status": "status"},
-                "ExpressionAttributeValues": {":deleting": "deleting"},
+                "ExpressionAttributeValues": {
+                    ":deleting": "deleting",
+                    ":snapshot": item["created_at"],
+                },
             }
-            if _parse_utc(item["created_at"]) >= utc_now() - timedelta(hours=1):
+            if parse_utc(item["created_at"]) >= utc_now() - timedelta(hours=1):
                 # A signed PUT can still arrive after deletion; retain tracking through
-                # the abandonment window and remove any late object on subsequent lists.
+                # the abandonment window and remove late objects after retention.
                 params["ExpressionAttributeValues"][":done"] = True
                 self.table.update_item(
                     **params,
@@ -262,48 +332,112 @@ class MediaService:
             if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
                 raise
 
+    @storage_errors
     def delete_media(self, user_sub: str, media_id: str) -> None:
-        item = self.table.get_item(Key=self._key(user_sub, media_id), ConsistentRead=True).get(
-            "Item"
-        )
-        if not item or item.get("deletion_complete") or not self._claim_delete(item):
+        item = self._get(user_sub, media_id)
+        if not self._claim_delete(item):
             raise MediaNotFoundError
         self._finish_delete(item)
 
-    def cleanup_pending(self, user_sub: str) -> int:
-        cutoff = (utc_now() - timedelta(hours=1)).isoformat()
+    def _cleanup_page(self, items: list[dict[str, Any]]) -> int:
+        cutoff = utc_now() - timedelta(hours=1)
         deleted = 0
-        for item in self._items(
-            user_sub,
-            FilterExpression=Attr("status").eq("deleting")
-            | (Attr("status").eq("pending") & Attr("created_at").lt(cutoff)),
-        ):
-            if item["status"] == "deleting" or self._claim_delete(item, cutoff=cutoff):
+        for item in items:
+            if item.get("deletion_complete") and parse_utc(item["created_at"]) >= cutoff:
+                continue
+            if item["status"] == "deleting" or (
+                item["status"] == "pending" and self._claim_delete(item, cutoff=cutoff)
+            ):
                 self._finish_delete(item)
                 deleted += 1
         return deleted
 
-    def _cleanup_orphans(self, user_sub: str) -> None:
+    @storage_errors
+    def cleanup_pending(self, user_sub: str) -> int:
+        """Compatibility helper: process at most 200 records, never an unbounded sweep."""
+        page = self._media_page(user_sub, 200)
+        return self._cleanup_page(page.get("Items", []))
+
+    def _media_page(
+        self, user_sub: str, limit: int, cursor: dict[str, str] | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "KeyConditionExpression": Key("pk").eq(self._key(user_sub, "")["pk"])
+            & Key("sk").begins_with("MEDIA#"),
+            "Limit": limit,
+            "ConsistentRead": True,
+        }
+        if cursor:
+            if (
+                set(cursor) != {"pk", "sk"}
+                or cursor["pk"] != self._key(user_sub, "")["pk"]
+                or not cursor["sk"].startswith("MEDIA#")
+            ):
+                raise ValueError("Invalid media maintenance checkpoint")
+            params["ExclusiveStartKey"] = cursor
+        return self.table.query(**params)
+
+    def _orphan_page(
+        self, user_sub: str, limit: int, cursor: str | None = None
+    ) -> tuple[int, str | None]:
         prefix = f"users/{user_sub}/media/"
-        params = {"Bucket": settings.media_bucket, "Prefix": prefix, "MaxKeys": 200}
+        params = {"Bucket": settings.media_bucket, "Prefix": prefix, "MaxKeys": limit}
+        if cursor:
+            params["ContinuationToken"] = cursor
         cutoff = utc_now() - timedelta(hours=1)
-        while True:
-            page = self._storage("list_objects_v2", **params)
-            for obj in page.get("Contents", []):
-                if obj["LastModified"] >= cutoff:
-                    continue
-                filename = obj["Key"][len(prefix) :]
-                try:
-                    media_id = str(UUID(filename.rsplit(".", 1)[0]))
-                except ValueError:
-                    continue
-                # A PUT authorized before expiry may finish after its tombstone is gone.
-                # UUIDs are server-generated and never reused; an absent record cannot
-                # later complete successfully, even if the object's PUT is still active.
-                if not self.table.get_item(
-                    Key=self._key(user_sub, media_id), ConsistentRead=True
-                ).get("Item"):
-                    self._storage("delete_object", Bucket=settings.media_bucket, Key=obj["Key"])
-            if not page.get("IsTruncated"):
-                break
-            params["ContinuationToken"] = page["NextContinuationToken"]
+        page = self._storage("list_objects_v2", **params)
+        candidates = []
+        for obj in page.get("Contents", []):
+            if not obj["Key"].startswith(prefix) or obj["LastModified"] >= cutoff:
+                continue
+            filename = obj["Key"][len(prefix) :]
+            try:
+                media_id = str(UUID(filename.rsplit(".", 1)[0]))
+            except ValueError:
+                continue
+            candidates.append((obj["Key"], self._key(user_sub, media_id)))
+        tracked = existing_keys(self.table, [key for _, key in candidates])
+        deleted = 0
+        for object_key, key in candidates:
+            if key["sk"] not in tracked:
+                self._storage("delete_object", Bucket=settings.media_bucket, Key=object_key)
+                deleted += 1
+        return deleted, page.get("NextContinuationToken") if page.get("IsTruncated") else None
+
+    @storage_errors
+    def maintain(self, user_sub: str, limit: int = 100) -> dict[str, Any]:
+        """Process one bounded page, saving progress only after the whole page succeeds."""
+        user_sub = _user_sub_adapter.validate_python(user_sub)
+        limit = _limit_adapter.validate_python(limit)
+        key = {"pk": self._key(user_sub, "")["pk"], "sk": "MAINTENANCE#media"}
+        state = self.table.get_item(Key=key, ConsistentRead=True).get("Item", {})
+        phase = state.get("phase", "media")
+        cursor = state.get("cursor")
+        if phase == "media":
+            if cursor is not None and not isinstance(cursor, dict):
+                raise ValueError("Invalid media maintenance checkpoint")
+            page = self._media_page(user_sub, limit, cursor)
+            deleted = self._cleanup_page(page.get("Items", []))
+            next_cursor = page.get("LastEvaluatedKey")
+            next_phase = "media" if next_cursor else "orphans"
+        elif phase == "orphans":
+            if cursor is not None and not isinstance(cursor, str):
+                raise ValueError("Invalid orphan maintenance checkpoint")
+            deleted, next_cursor = self._orphan_page(user_sub, limit, cursor)
+            next_phase = "orphans" if next_cursor else "media"
+        else:
+            raise ValueError("Invalid media maintenance phase")
+        checkpoint = {**key, "phase": next_phase, "version": str(uuid7())}
+        if next_cursor:
+            checkpoint["cursor"] = next_cursor
+        params: dict[str, Any] = {
+            "Item": checkpoint,
+            "ConditionExpression": "#version = :version" if state else "attribute_not_exists(pk)",
+        }
+        if state:
+            params.update(
+                ExpressionAttributeNames={"#version": "version"},
+                ExpressionAttributeValues={":version": state["version"]},
+            )
+        self.table.put_item(**params)
+        return {"phase": phase, "deleted": deleted, "next_phase": next_phase}

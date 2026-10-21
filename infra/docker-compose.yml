@@ -28,9 +28,28 @@ services:
       context: ../client
       dockerfile: ../infra/docker/client.Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_COGNITO_AUTHORITY: ${NEXT_PUBLIC_COGNITO_AUTHORITY:-}
+        NEXT_PUBLIC_COGNITO_CLIENT_ID: ${NEXT_PUBLIC_COGNITO_CLIENT_ID:-}
+        NEXT_PUBLIC_COGNITO_DOMAIN: ${NEXT_PUBLIC_COGNITO_DOMAIN:-}
+        NEXT_PUBLIC_COGNITO_SCOPE: ${NEXT_PUBLIC_COGNITO_SCOPE:-openid email profile homie/mcp:tools}
     ports: ["3000:3000"]
     depends_on: [server]
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: [phone-test]
+    ports: ["127.0.0.1:8080:80"]
+    volumes:
+      - ./caddy/dev.Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on: [client, server]
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: [phone-test]
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+    depends_on: [caddy]
 
 volumes:
   dynamodb-data:

@@ -22,6 +22,7 @@ from app.services.memory_service import (
     ensure_table,
     get_dynamodb_resource,
 )
+from app.services.storage import StorageError
 
 
 def test_crud(service: MemoryService, ddb_table: Any) -> None:
@@ -95,6 +96,14 @@ def test_recall_ranks_matches_and_falls_back_to_newest(service: MemoryService) -
     assert older in service.recall("alice", "desk drawer")
 
 
+def test_recall_finds_match_beyond_newest_200_memories(service: MemoryService) -> None:
+    target = service.create_memory("alice", "Passport in the attic", "fact", [])
+    for i in range(200):
+        service.create_memory("alice", f"Unrelated memory {i}", "fact", [])
+
+    assert service.recall("alice", "passport") == [target]
+
+
 def test_duplicates_remain_separate_records(service: MemoryService) -> None:
     first = service.create_memory("alice", "Same", "fact", ["a", " a "])
     second = service.create_memory("alice", "Same", "fact", ["a"])
@@ -157,7 +166,7 @@ def test_failed_idempotent_transaction_leaves_no_records(
         raise ClientError({"Error": {"Code": "InternalServerError"}}, "TransactWriteItems")
 
     monkeypatch.setattr(service.table.meta.client, "transact_write_items", fail_transaction)
-    with pytest.raises(ClientError):
+    with pytest.raises(StorageError):
         service.create_memory("alice", "No partial write", "fact", [], request_id=request_id)
     assert service.list_memories("alice") == []
     assert (
@@ -172,7 +181,13 @@ def test_cancelled_idempotent_transaction_without_record_is_retryable(
     service: MemoryService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def cancel_transaction(**kwargs: Any) -> None:
-        raise ClientError({"Error": {"Code": "TransactionCanceledException"}}, "TransactWriteItems")
+        raise ClientError(
+            {
+                "Error": {"Code": "TransactionCanceledException"},
+                "CancellationReasons": [{"Code": "None"}, {"Code": "ConditionalCheckFailed"}],
+            },
+            "TransactWriteItems",
+        )
 
     monkeypatch.setattr(service.table.meta.client, "transact_write_items", cancel_transaction)
 
@@ -377,7 +392,7 @@ def test_list_is_newest_first(service: MemoryService, ddb_table: Any) -> None:
     service.table.query = spy_query
     result = service.list_memories("alice", limit=10)
     assert [m.id for m in result] == [m.id for m in reversed(created)][:10]
-    assert limits == [10]
+    assert limits == [10, 200]  # One memory page and one shared reverse-link page.
 
 
 def test_query_search_spans_dynamodb_pages(service: MemoryService, ddb_table: Any) -> None:
@@ -415,7 +430,7 @@ def test_profile_read_errors_are_not_swallowed(service: MemoryService) -> None:
         return original_get_item(**kwargs)
 
     service.table.get_item = throttled_profile
-    with pytest.raises(ClientError):
+    with pytest.raises(StorageError):
         service.get_memory("alice", memory.id)
 
 
