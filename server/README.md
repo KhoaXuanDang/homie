@@ -1,4 +1,4 @@
-# Backend foundation
+# Homie server
 
 From `server/`, run `uv sync`, then `uv run fastapi dev app/main.py`.
 `GET /health` remains unauthenticated and returns `{"status": "ok"}`.
@@ -20,19 +20,52 @@ volume, so rebuilding or recreating containers keeps memories;
 Set `COGNITO_USER_POOL_ID` and the allowed `COGNITO_CLIENT_IDS` (a comma-separated
 list or JSON array) for the deployment. The API verifies RS256 signatures against
 the pool's cached JWKS, checks the issuer, access-token use, client ID, expiration,
-and required scope. Memory API requests require `MCP_TOOLS_SCOPE`; requests under
-`/mcp` require `MCP_SERVICE_SCOPE`. Invalid or missing credentials return 401.
+and required scope. Memory API requests require `MCP_TOOLS_SCOPE`. The `/mcp`
+HTTP endpoint accepts either `MCP_TOOLS_SCOPE` or `MCP_SERVICE_SCOPE`, so a
+service token can initialize and list tools. Calling a personal-memory tool
+requires `MCP_TOOLS_SCOPE` and a linked user subject; a service-only token gets
+an MCP tool error. Invalid or missing credentials return 401 without a
+`WWW-Authenticate` header.
 There is no mock-auth bypass. The sample pool and client IDs are development
 defaults only; configure your own values for deployed environments.
 
 Authenticated memory API requests are limited to 120 requests per user per minute
 and MCP requests to 60, per process.
 
+## MCP endpoint
+
+`POST /mcp` serves MCP Streamable HTTP and negotiates protocol version
+`2025-11-25`. The server uses stateless JSON responses, so clients do not need
+to retain a session ID. Send a Cognito bearer access token and
+`Accept: application/json, text/event-stream`; after `initialize`, send
+`MCP-Protocol-Version: 2025-11-25` on subsequent requests. `PUBLIC_BASE_URL`
+and `CORS_ORIGINS` supply the allowed server host and browser origins. When
+`PUBLIC_BASE_URL` is unset, local MCP requests may use either
+`localhost:8000` or `127.0.0.1:8000` as the Host. An explicitly configured
+`PUBLIC_BASE_URL` allows only its host.
+
+The endpoint exposes three tools:
+
+| Tool | Arguments | Successful `structuredContent` |
+|---|---|---|
+| `remember` | `content`, optional `kind` (default `fact`), `tags`, `event_id` | `{"status":"success","memory_id":"<uuid>"}` |
+| `recall` | `query`, optional `kind` | `{"memories":[{"id":"<uuid>","content":"...","kind":"fact","tags":[],"created_at":"<ISO 8601>"}]}` |
+| `forget` | `memory_id` | `{"status":"success","memory_id":"<uuid>"}` |
+
+`recall` returns at most ten memories. A blank query lists the newest memories;
+a nonblank query searches the user's newest 2,000 memories, ranks matches, and
+falls back to recent memories when nothing matches. Older memories are outside
+the P0 search window. Results are scoped to the authenticated user, omit `event_id`, and
+express `created_at` in the user's profile timezone (UTC by default). Missing
+or invalid inputs and unavailable storage produce a plain-language MCP tool
+error. This P0 endpoint uses preconfigured Cognito bearer tokens; MCP OAuth
+discovery and audience-bound tokens are separate integration work.
+
 ## Memory API
 
 ```sh
 AUTH_HEADER="$(printf '%s %s' 'Bearer' "$COGNITO_ACCESS_TOKEN")"
-curl -X POST http://127.0.0.1:8000/memories \
+curl -X POST http://127.0.0.1:8000/api/memories \
   -H "Authorization: $AUTH_HEADER" \
   -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
   -H 'Content-Type: application/json' \

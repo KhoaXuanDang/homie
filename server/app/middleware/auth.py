@@ -222,6 +222,7 @@ class McpAuthGate:
             await self.app(scope, receive, send)
             return
 
+        scope.setdefault("state", {}).pop("user_sub", None)
         request = Request(scope, receive=receive)
         try:
             token = _bearer_token(request)

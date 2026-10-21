@@ -95,6 +95,14 @@ def test_recall_ranks_matches_and_falls_back_to_newest(service: MemoryService) -
     assert older in service.recall("alice", "desk drawer")
 
 
+def test_recall_finds_match_beyond_newest_200_memories(service: MemoryService) -> None:
+    target = service.create_memory("alice", "Passport in the attic", "fact", [])
+    for i in range(200):
+        service.create_memory("alice", f"Unrelated memory {i}", "fact", [])
+
+    assert service.recall("alice", "passport") == [target]
+
+
 def test_duplicates_remain_separate_records(service: MemoryService) -> None:
     first = service.create_memory("alice", "Same", "fact", ["a", " a "])
     second = service.create_memory("alice", "Same", "fact", ["a"])
