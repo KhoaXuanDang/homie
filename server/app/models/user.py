@@ -6,7 +6,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, StringConstraints, m
 
 UserSub = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 TravelMode = Literal["DRIVE", "WALK", "BICYCLE", "TRANSIT"]
-Address = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=300)]
+HomeAddress = Annotated[str, StringConstraints(strip_whitespace=True, max_length=300)]
 
 
 def _validate_timezone(value: str) -> str:
@@ -26,14 +26,6 @@ class Home(BaseModel):
     lng: float | None = None
 
 
-class HomeInput(BaseModel):
-    """Clients send only the address; the server owns the coordinates."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    address: Address
-
-
 class Profile(BaseModel):
     model_config = ConfigDict(extra="forbid", from_attributes=True)
 
@@ -43,19 +35,20 @@ class Profile(BaseModel):
 
 
 class ProfileUpdate(BaseModel):
-    """Omitted fields keep their stored value; `home: null` clears the home address."""
+    """Omitted fields keep their stored value. Clients send only the home address (the
+    server owns the coordinates); an empty `home_address` clears home."""
 
     model_config = ConfigDict(extra="forbid")
 
     timezone: Timezone | None = None
-    home: HomeInput | None = None
+    home_address: HomeAddress | None = None
     travel_mode: TravelMode | None = None
 
     @model_validator(mode="after")
     def validate_updates(self) -> Self:
         if not self.model_fields_set:
             raise ValueError("Provide at least one field to update")
-        if any(getattr(self, f) is None for f in self.model_fields_set if f != "home"):
+        if any(getattr(self, f) is None for f in self.model_fields_set):
             raise ValueError("Update fields cannot be null")
         return self
 

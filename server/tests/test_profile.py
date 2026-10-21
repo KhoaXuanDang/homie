@@ -7,7 +7,9 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.config import settings
+from app.models.user import ProfileUpdate
 from app.routes.me import get_profile_service
+from app.services.memory_service import DELETING_SK
 from app.services.profile_service import ProfileService
 from tests.test_memories import auth, client  # noqa: F401
 
@@ -33,7 +35,7 @@ def test_put_merges_and_round_trips(api: TestClient) -> None:
     first = api.put(
         "/api/me/profile",
         headers=auth(),
-        json={"timezone": "America/New_York", "home": {"address": " 1 Main St "}},
+        json={"timezone": "America/New_York", "home_address": " 1 Main St "},
     )
     assert first.status_code == 200
     expected = {
@@ -46,9 +48,16 @@ def test_put_merges_and_round_trips(api: TestClient) -> None:
     second = api.put("/api/me/profile", headers=auth(), json={"travel_mode": "WALK"})
     assert second.json() == {**expected, "travel_mode": "WALK"}
     assert api.get("/api/me/profile", headers=auth()).json() == second.json()
-    # home: null clears the address.
-    cleared = api.put("/api/me/profile", headers=auth(), json={"home": None})
-    assert cleared.json()["home"] is None
+    # An empty home_address clears home and keeps the other fields.
+    cleared = api.put("/api/me/profile", headers=auth(), json={"home_address": " "})
+    assert cleared.json() == {**expected, "travel_mode": "WALK", "home": None}
+
+
+def test_put_accepts_full_settings_payload(api: TestClient) -> None:
+    # The Settings page sends every field on each save.
+    body = {"timezone": "Asia/Tokyo", "travel_mode": "TRANSIT", "home_address": ""}
+    response = api.put("/api/me/profile", headers=auth(), json=body)
+    assert response.json() == {"timezone": "Asia/Tokyo", "home": None, "travel_mode": "TRANSIT"}
 
 
 @pytest.mark.parametrize(
@@ -57,8 +66,9 @@ def test_put_merges_and_round_trips(api: TestClient) -> None:
         {"timezone": "Not/AZone"},
         {"timezone": None},
         {"travel_mode": "FLY"},
-        {"home": {"address": ""}},
-        {"home": {"address": "1 Main St", "lat": 1.0}},
+        {"home_address": None},
+        {"home_address": "x" * 301},
+        {"home": {"address": "1 Main St"}},
         {"user_sub": "bob"},
         {},
     ],
@@ -124,3 +134,33 @@ def test_delete_me_paginates_past_one_query_page(ddb_table: Any) -> None:
         )["Items"]
         == []
     )
+
+
+def test_delete_me_keeps_records_when_s3_reports_errors(
+    ddb_table: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "media_bucket", "homie-test-media")
+    s3 = boto3.client("s3", region_name=settings.aws_region)
+    s3.create_bucket(Bucket="homie-test-media")
+    s3.put_object(Bucket="homie-test-media", Key="users/alice/media/1.jpg", Body=b"x")
+    failing = {"Errors": [{"Key": "users/alice/media/1.jpg", "Code": "AccessDenied"}]}
+    monkeypatch.setattr(s3, "delete_objects", lambda **_: failing)
+    service = ProfileService(table=ddb_table, s3=s3)
+    service.put_profile("alice", ProfileUpdate(timezone="Asia/Tokyo"))
+
+    with pytest.raises(RuntimeError):
+        service.delete_all_user_data("alice")
+    assert service.get_profile("alice").timezone == "Asia/Tokyo"
+
+
+def test_writes_are_blocked_while_account_is_deleting(api: TestClient, ddb_table: Any) -> None:
+    ddb_table.put_item(Item={"pk": "USER#alice", "sk": DELETING_SK})
+    memory = {"content": "Keys", "kind": "fact"}
+    assert api.post("/api/memories", headers=auth(), json=memory).status_code == 409
+    assert (
+        api.put("/api/me/profile", headers=auth(), json={"travel_mode": "WALK"}).status_code == 409
+    )
+    assert api.post("/api/memories", headers=auth("bob"), json=memory).status_code == 201
+    # A finished delete removes the marker, so the account can be used again.
+    assert api.delete("/api/me", headers=auth()).status_code == 204
+    assert api.post("/api/memories", headers=auth(), json=memory).status_code == 201

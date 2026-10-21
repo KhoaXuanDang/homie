@@ -50,6 +50,32 @@ class IdempotencyRecordDeletedError(Exception):
     pass
 
 
+class AccountDeletingError(Exception):
+    pass
+
+
+# Marker item that exists while DELETE /api/me is wiping the user's records.
+DELETING_SK = "DELETING"
+
+
+def write_unless_deleting(table: Any, user_sub: str, items: list[dict[str, Any]]) -> None:
+    """Transact `items` only if the user's account is not being deleted."""
+    check = {
+        "ConditionCheck": {
+            "TableName": table.name,
+            "Key": {"pk": f"USER#{user_sub}", "sk": DELETING_SK},
+            "ConditionExpression": "attribute_not_exists(pk)",
+        }
+    }
+    try:
+        table.meta.client.transact_write_items(TransactItems=[*items, check])
+    except ClientError as exc:
+        reasons = exc.response.get("CancellationReasons", [])
+        if len(reasons) == len(items) + 1 and reasons[-1].get("Code") == "ConditionalCheckFailed":
+            raise AccountDeletingError("Account deletion in progress") from exc
+        raise
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -179,8 +205,10 @@ class MemoryService:
                 )
 
             try:
-                self.table.meta.client.transact_write_items(
-                    TransactItems=[
+                write_unless_deleting(
+                    self.table,
+                    user_sub,
+                    [
                         {
                             "Put": {
                                 "TableName": self.table.name,
@@ -195,7 +223,7 @@ class MemoryService:
                                 "ConditionExpression": "attribute_not_exists(pk)",
                             }
                         },
-                    ]
+                    ],
                 )
             except ClientError as exc:
                 # Only treat a failed transaction as a replay if its request record now exists.
@@ -210,7 +238,9 @@ class MemoryService:
                     raise IdempotencyInProgressError("Request in progress, try again") from exc
                 raise
         else:
-            self.table.put_item(Item=item)
+            write_unless_deleting(
+                self.table, user_sub, [{"Put": {"TableName": self.table.name, "Item": item}}]
+            )
         return self._to_memory(item, *self._timezone(user_sub))
 
     @staticmethod

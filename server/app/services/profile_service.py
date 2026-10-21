@@ -1,5 +1,4 @@
 import logging
-from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -8,7 +7,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from app.config import settings
 from app.models.user import Profile, ProfileUpdate, UserSub
-from app.services.memory_service import get_table
+from app.services.memory_service import DELETING_SK, get_table, write_unless_deleting
 
 logger = logging.getLogger(__name__)
 
@@ -53,32 +52,45 @@ class ProfileService:
 
     def put_profile(self, user_sub: str, data: ProfileUpdate) -> Profile:
         user_sub = self._validate_sub(user_sub)
-        current = self.get_profile(user_sub)
         changes = data.model_dump(exclude_unset=True)
-        item: dict[str, Any] = {
-            "pk": f"USER#{user_sub}",
-            "sk": "PROFILE",
-            "timezone": changes.get("timezone", current.timezone),
-            "travel_mode": changes.get("travel_mode", current.travel_mode),
+        sets = {key: changes[key] for key in ("timezone", "travel_mode") if key in changes}
+        removes = []
+        if "home_address" in changes:
+            if changes["home_address"]:
+                # dev-note: stores the address only; Plan 2 geocodes it server-side into lat/lng.
+                sets["home"] = {"address": changes["home_address"]}
+            else:
+                removes.append("home")
+        expression = " ".join(
+            part
+            for part in (
+                sets and "SET " + ", ".join(f"#{key} = :{key}" for key in sets),
+                removes and "REMOVE " + ", ".join(f"#{key}" for key in removes),
+            )
+            if part
+        )
+        # Field-level update: concurrent edits to different fields both survive.
+        update: dict[str, Any] = {
+            "TableName": self.table.name,
+            "Key": {"pk": f"USER#{user_sub}", "sk": "PROFILE"},
+            "UpdateExpression": expression,
+            "ExpressionAttributeNames": {f"#{key}": key for key in [*sets, *removes]},
         }
-        if "home" in changes:
-            # dev-note: stores the address only; Plan 2 geocodes it server-side into lat/lng.
-            home = changes["home"]
-        else:
-            home = current.home and current.home.model_dump(exclude_none=True)
-        if home:
-            item["home"] = {
-                key: Decimal(str(value)) if isinstance(value, float) else value
-                for key, value in home.items()
-            }
-        self.table.put_item(Item=item)
-        return self._to_profile(item)
+        if sets:
+            update["ExpressionAttributeValues"] = {f":{key}": value for key, value in sets.items()}
+        write_unless_deleting(self.table, user_sub, [{"Update": update}])
+        return self.get_profile(user_sub)
 
     def delete_all_user_data(self, user_sub: str) -> None:
         """Delete every USER#{sub} item and the user's S3 prefix. Safe to repeat."""
         user_sub = self._validate_sub(user_sub)
         # dev-note: no Google integration yet; Plan 2 must revoke the GOOGLE refresh token
         # here, before its item is deleted below.
+        # The marker blocks new writes until every record is gone (memory_service
+        # write_unless_deleting). If anything below fails it stays, so writes keep failing
+        # until a retried delete finishes.
+        marker = {"pk": f"USER#{user_sub}", "sk": DELETING_SK}
+        self.table.put_item(Item=marker)
         # S3 first: if it fails, the records remain and a retry repeats the whole delete.
         if settings.media_bucket:
             self._delete_media(user_sub)
@@ -91,10 +103,12 @@ class ProfileService:
             while True:
                 response = self.table.query(**query_kwargs)
                 for item in response.get("Items", []):
-                    batch.delete_item(Key={"pk": item["pk"], "sk": item["sk"]})
+                    if item["sk"] != DELETING_SK:
+                        batch.delete_item(Key={"pk": item["pk"], "sk": item["sk"]})
                 if "LastEvaluatedKey" not in response:
                     break
                 query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        self.table.delete_item(Key=marker)
 
     def _delete_media(self, user_sub: str) -> None:
         s3 = self._s3 if self._s3 is not None else get_s3_client()
@@ -105,6 +119,9 @@ class ProfileService:
             # list_objects_v2 pages hold at most 1000 keys, the delete_objects limit.
             keys = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
             if keys:
-                s3.delete_objects(
+                response = s3.delete_objects(
                     Bucket=settings.media_bucket, Delete={"Objects": keys, "Quiet": True}
                 )
+                # Per-object failures come back with HTTP 200; stop before deleting records.
+                if response.get("Errors"):
+                    raise RuntimeError(f"S3 failed to delete {len(response['Errors'])} objects")
