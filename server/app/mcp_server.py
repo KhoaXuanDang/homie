@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, PlainValidator, ValidationError, Wit
 from app.config import settings
 from app.models.memory import Kind, MemoryCreate
 from app.services.memory_service import MemoryService
+from app.services.storage import StorageError
 
 _KINDS = get_args(Kind)
 
@@ -137,7 +138,7 @@ def remember(
         memory = MemoryService().create_memory(
             user_sub, data.content, data.kind, data.tags, data.event_id
         )
-    except (BotoCoreError, ClientError) as exc:
+    except (BotoCoreError, ClientError, StorageError) as exc:
         raise _storage_unavailable() from exc
     return ChangeResult(status="success", memory_id=str(memory.id))
 
@@ -161,7 +162,7 @@ def recall(
         raise ToolError("Please choose a valid memory type.")
     try:
         memories = MemoryService().recall(user_sub, query, kind=kind, limit=10)
-    except (BotoCoreError, ClientError) as exc:
+    except (BotoCoreError, ClientError, StorageError) as exc:
         raise _storage_unavailable() from exc
     return RecallResult(
         memories=[
@@ -192,7 +193,7 @@ def forget(
         raise ToolError("Please provide a valid memory ID.") from exc
     try:
         deleted = MemoryService().delete_memory(user_sub, parsed_id)
-    except (BotoCoreError, ClientError) as exc:
+    except (BotoCoreError, ClientError, StorageError) as exc:
         raise _storage_unavailable() from exc
     if not deleted:
         raise ToolError("I couldn't find that memory.")

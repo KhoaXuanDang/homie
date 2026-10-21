@@ -100,8 +100,10 @@ in this phase. Memory bodies cannot override the profile timezone.
 
 Set `MEDIA_BUCKET` to the private S3 bucket provisioned by Terraform. Media routes
 use the same Cognito authentication and per-user isolation as memories.
-The server role needs S3 GetObject, PutObject, DeleteObject, and ListBucket
-(restricted to `users/*/media/` prefixes), plus access to the DynamoDB table.
+The API role needs S3 GetObject, PutObject and DeleteObject, plus access to the
+DynamoDB table (including BatchGetItem and TransactWriteItems). The maintenance
+role additionally needs ListBucket restricted to `users/*/media/` prefixes.
+Listing media never requires S3 ListBucket, HEAD or DeleteObject permissions.
 
 - `POST /api/media` accepts `{content_type, size, caption?}` and returns 201
   `{media, upload_url, upload_headers, expires_in}`. The media starts `pending`;
@@ -130,18 +132,49 @@ Media responses use `Cache-Control: no-store`. Uploaded media receive fresh
 are never stored in DynamoDB. Pending media have an empty `url`. Clients should
 refresh lists before URL expiry (the existing client uses five minutes).
 
-On each list request, pending uploads older than one hour are removed for that
-user, including any abandoned object. Cleanup conditionally claims the pending
-record before touching S3, so concurrent completion cannot lose uploaded media.
-A private `deleting` marker hides deletions and blocks completion; it is retained
-on storage failures so the next list or explicit delete retries. After successful
-deletion, uploads less than one hour old retain a tombstone through that same
-abandonment window: a still-valid PUT or in-flight upload may otherwise recreate
-the object. Subsequent lists remove late objects and finally remove the tombstone
-once the window has elapsed. Neither markers nor tombstones are returned.
-List requests also reconcile objects older than one hour under that user's media
-prefix against strongly consistent media records, removing untracked objects.
-This catches a slow PUT that started before URL expiry but finished after its
-tombstone expired; S3 URL expiry does not bound an already-running upload.
+`GET /api/media` is read-only: it queries uploaded records, reads the profile once,
+batch-checks linked memories consistently, and signs URLs locally. It never
+contacts S3 or performs cleanup. Missing `MEDIA_BUCKET` still fails URL signing.
+Storage outages (DynamoDB or S3) return a sanitized retryable 503.
+
+`media.memory_id` is the only stored link authority. Memory responses derive
+`media_ids` in one paginated traversal of that user's media partition (not one
+query per memory). Legacy reverse lists are ignored. Linking atomically checks
+memory existence and updates the media. Deleting a memory does not rewrite media:
+consistent batch existence checks hide dangling references in media responses,
+without racing a newer relink or unlink.
+
+### Scheduled maintenance
+
+Run from `server/`, with deployment credentials and the same configuration as the API:
+
+```sh
+uv run python -m scripts.maintain_media --user-sub alice --limit 100
+```
+
+Schedule repeated invocations for each provisioned user subject. User discovery
+and scheduling are deployment responsibilities; never accept the subject from an
+untrusted HTTP body. Each invocation processes **one page**, evaluating at most
+`--limit` records or objects (`1..200`, default 100), including nonmatching records.
+The `MAINTENANCE#media` item in that user's partition persists phase and pagination
+progress across processes. Phases alternate between media records and S3 objects.
+Continue running after a completed cycle to catch later abandoned uploads.
+Checkpoints advance only after successful page processing; failures exit nonzero
+with a sanitized retry message and can safely retry. Overlapping workers use
+conditional checkpoint writes; prefer one worker per subject.
+
+Maintenance conditionally claims pending uploads older than one hour using the
+original status and timestamp snapshot before removing their objects. Timestamps
+are compared as datetimes (including legacy offsets); new writes use fixed
+microsecond UTC precision. A private `deleting` marker blocks completion and
+repeated client deletion (404). Failed S3 removals retain it for maintenance retries.
+Successful deletions retain fresh markers until one hour after upload creation;
+fresh completed markers cause no repeated S3 deletes. After retention, maintenance
+deletes again to catch a late authorized PUT, then removes the marker.
+
+The S3 phase reconciles objects older than one hour under only that user's prefix
+using consistent batch record reads, preserving valid records and other users'
+objects. It catches PUTs that finish after marker removal: URL expiry does not
+bound an already-running upload. Neither markers nor tombstones are returned.
 
 Run `uv run pytest`, `uv run ruff check .`, and `uv run ruff format --check .`.
