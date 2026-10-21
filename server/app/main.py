@@ -2,10 +2,12 @@ import logging
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
@@ -104,3 +106,41 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(memories.router)
 app.add_route("/mcp", mcp_app, methods=["GET", "POST", "DELETE"])
+
+
+def custom_openapi() -> dict[str, Any]:
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+    schema["components"]["schemas"]["HTTPValidationError"] = {
+        "title": "HTTPValidationError",
+        "type": "object",
+        "required": ["detail", "errors"],
+        "properties": {
+            "detail": {"title": "Detail", "type": "string"},
+            "errors": {
+                "title": "Errors",
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/ValidationError"},
+            },
+        },
+    }
+    schema["components"]["schemas"]["ValidationError"] = {
+        "title": "ValidationError",
+        "type": "object",
+        "required": ["loc", "msg", "type"],
+        "properties": {
+            "loc": {
+                "title": "Location",
+                "type": "array",
+                "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            },
+            "msg": {"title": "Message", "type": "string"},
+            "type": {"title": "Error Type", "type": "string"},
+        },
+    }
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
