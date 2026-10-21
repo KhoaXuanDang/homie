@@ -3,11 +3,13 @@
 import { useQueryClient } from "@tanstack/react-query"
 import { WebStorageStateStore } from "oidc-client-ts"
 import { useRouter } from "next/navigation"
-import { createContext, use, useMemo } from "react"
+import { createContext, use, useMemo, useRef, useState } from "react"
 import {
   AuthProvider as OidcProvider,
   useAuth as useOidc,
 } from "react-oidc-context"
+
+import { env } from "@/lib/env"
 
 export type User = { sub: string; name: string; email: string }
 type Session = { user: User; accessToken: string }
@@ -18,19 +20,22 @@ type Auth = {
   session: Session | null
   /** Plain-language message when the last sign-in attempt failed. */
   error: string | null
+  /** True while explicit sign-out is clearing the current account. */
+  signingOut: boolean
   /** Sends the user to Cognito's Hosted UI (sign-in and sign-up). */
   signIn: () => Promise<void>
   signOut: () => Promise<void>
+  /** Blocks a rejected access token and removes it from persistent auth storage. */
+  invalidateSession: (accessToken: string) => void
+  isSessionTokenActive: (accessToken: string) => boolean
 }
 
 // Cognito Hosted UI with authorization code + PKCE (plan Task 9). NEXT_PUBLIC_*
 // must be referenced literally so Next inlines them at build time.
-const AUTHORITY = process.env.NEXT_PUBLIC_COGNITO_AUTHORITY ?? ""
-const CLIENT_ID = process.env.NEXT_PUBLIC_COGNITO_CLIENT_ID ?? ""
-const DOMAIN = process.env.NEXT_PUBLIC_COGNITO_DOMAIN ?? ""
-const SCOPE =
-  process.env.NEXT_PUBLIC_COGNITO_SCOPE ??
-  "openid email profile homie/mcp:tools"
+const AUTHORITY = env.cognitoAuthority
+const CLIENT_ID = env.cognitoClientId
+const DOMAIN = env.cognitoDomain
+const SCOPE = env.cognitoScope
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter()
@@ -49,7 +54,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           ? new WebStorageStateStore({ store: window.localStorage })
           : undefined
       }
-      onSigninCallback={() => router.replace("/memories")}
+      onSigninCallback={() => {
+        router.replace("/memories")
+        window.dispatchEvent(new Event("homie:session-restored"))
+      }}
     >
       <SessionBridge>{children}</SessionBridge>
     </OidcProvider>
@@ -59,40 +67,69 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 function SessionBridge({ children }: { children: React.ReactNode }) {
   const oidc = useOidc()
   const queryClient = useQueryClient()
+  const [signingOut, setSigningOut] = useState(false)
+  const [invalidatedTokens, setInvalidatedTokens] = useState<Set<string>>(
+    () => new Set(),
+  )
+  const invalidatedTokensRef = useRef(new Set<string>())
   const user = oidc.user && !oidc.user.expired ? oidc.user : null
 
   const value = useMemo<Auth>(
     () => ({
       loading: oidc.isLoading,
-      session: user && {
-        accessToken: user.access_token,
-        user: {
-          sub: user.profile.sub,
-          email: user.profile.email ?? "",
-          name:
-            user.profile.name ??
-            user.profile.email?.split("@")[0] ??
-            "Homie user",
-        },
-      },
+      session:
+        user && !invalidatedTokens.has(user.access_token)
+          ? {
+              accessToken: user.access_token,
+              user: {
+                sub: user.profile.sub,
+                email: user.profile.email ?? "",
+                name:
+                  user.profile.name ??
+                  user.profile.email?.split("@")[0] ??
+                  "Homie user",
+              },
+            }
+          : null,
       error: oidc.error
         ? "Couldn't sign you in. Check your connection and try again."
         : null,
+      signingOut,
       signIn: async () => {
         await oidc.signinRedirect()
       },
+      invalidateSession: (accessToken) => {
+        if (invalidatedTokensRef.current.has(accessToken)) return
+        invalidatedTokensRef.current.add(accessToken)
+        setInvalidatedTokens((current) => new Set(current).add(accessToken))
+        if (oidc.user?.access_token === accessToken) {
+          void oidc.removeUser().catch(() => undefined)
+        }
+      },
+      isSessionTokenActive: (accessToken) =>
+        !invalidatedTokensRef.current.has(accessToken),
       signOut: async () => {
-        await queryClient.cancelQueries()
-        queryClient.clear()
-        await oidc.removeUser()
-        // Cognito's discovery has no end_session_endpoint, so end its session by hand.
-        const logout = new URL("/logout", DOMAIN)
-        logout.searchParams.set("client_id", CLIENT_ID)
-        logout.searchParams.set("logout_uri", window.location.origin)
-        window.location.assign(logout)
+        if (
+          !window.confirm("Sign out of Homie? Any unsaved work will be lost.")
+        )
+          return
+        setSigningOut(true)
+        try {
+          await queryClient.cancelQueries()
+          await oidc.removeUser()
+          queryClient.clear()
+          // Cognito's discovery has no end_session_endpoint, so end its session by hand.
+          const logout = new URL("/logout", DOMAIN)
+          logout.searchParams.set("client_id", CLIENT_ID)
+          logout.searchParams.set("logout_uri", window.location.origin)
+          window.location.assign(logout)
+        } catch (error) {
+          setSigningOut(false)
+          throw error
+        }
       },
     }),
-    [oidc, user, queryClient],
+    [oidc, user, queryClient, signingOut, invalidatedTokens],
   )
 
   return <AuthContext value={value}>{children}</AuthContext>
