@@ -4,12 +4,13 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta
 from time import time
 from typing import Any
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import jwt
 import pytest
-from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ClientError, EndpointConnectionError
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from httpx import Response
@@ -432,6 +433,39 @@ def test_forget_invalid_ids_and_storage_failure_are_safe(
     response = mcp.call("recall", {"query": "anything"})
     assert tool_error(response)
     assert "private-storage.example" not in response.text
+
+
+@pytest.mark.parametrize("transport", [False, True])
+@pytest.mark.parametrize(
+    ("tool", "arguments", "operation"),
+    [
+        ("remember", {"content": "Memory"}, "put_item"),
+        ("recall", {"query": ""}, "query"),
+        ("forget", {"memory_id": str(uuid4())}, "delete_item"),
+    ],
+)
+def test_service_storage_errors_are_sanitized_mcp_tool_errors(
+    mcp_client: tuple[McpClient, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    arguments: dict[str, Any],
+    operation: str,
+    transport: bool,
+) -> None:
+    mcp, table = mcp_client
+    result(mcp.initialize())
+    error = (
+        EndpointConnectionError(endpoint_url="secret-internal-storage")
+        if transport
+        else ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "secret"}},
+            operation,
+        )
+    )
+    monkeypatch.setattr(table, operation, Mock(side_effect=error))
+    response = mcp.call(tool, arguments)
+    assert tool_error(response) == "Memory storage is unavailable. Please try again shortly."
+    assert "secret" not in response.text
 
 
 def test_expected_tool_errors_keep_exact_safe_text(mcp_client: tuple[McpClient, Any]) -> None:

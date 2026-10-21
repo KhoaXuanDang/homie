@@ -519,6 +519,30 @@ def test_list_is_read_only_with_one_profile_and_one_link_batch(
         UpdateExpression="SET created_at = :old",
         ExpressionAttributeValues={":old": "2000-01-01T00:00:00Z"},
     )
+    upload(media_service, stale)
+    protected = [(key, media_service.table.get_item(Key=key)["Item"])]
+    for done, created_at in [
+        (False, "2000-01-01T00:00:00Z"),
+        (True, "2000-01-01T00:00:00Z"),
+        (True, datetime.now(UTC).isoformat()),
+    ]:
+        marker_id = create(media_client)["media"]["id"]
+        upload(media_service, marker_id)
+        marker_key = {"pk": "USER#alice", "sk": f"MEDIA#{marker_id}"}
+        media_service.table.update_item(
+            Key=marker_key,
+            UpdateExpression=(
+                "SET #status = :deleting, deletion_complete = :done, created_at = :created"
+            ),
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":deleting": "deleting",
+                ":done": done,
+                ":created": created_at,
+            },
+        )
+        protected.append((marker_key, media_service.table.get_item(Key=marker_key)["Item"]))
+    original_head = media_service.s3.head_object
     for operation in ("head_object", "list_objects_v2", "delete_object", "get_object"):
         monkeypatch.setattr(
             media_service.s3, operation, Mock(side_effect=AssertionError("GET performed S3 I/O"))
@@ -541,7 +565,12 @@ def test_list_is_read_only_with_one_profile_and_one_link_batch(
     assert batch.call_count == 1
     request = batch.call_args.kwargs["RequestItems"][media_service.table.name]
     assert request["ConsistentRead"] is True and len(request["Keys"]) == 1
-    assert original_get(Key=key)["Item"]["status"] == "pending"
+    for protected_key, snapshot in protected:
+        assert original_get(Key=protected_key)["Item"] == snapshot
+        assert (
+            original_head(Bucket=settings.media_bucket, Key=snapshot["s3_key"])["ContentLength"]
+            == 4
+        )
 
 
 def test_missing_bucket_blocks_presigning_not_empty_reads(
@@ -628,6 +657,10 @@ def test_reverse_links_are_derived_for_all_memory_responses(
     assert query.call_count == 2  # Not one reverse query per returned memory.
     with pytest.raises(MemoryNotFoundError):
         media_service.update_media("alice", media_id, MediaUpdate(memory_id=foreign.id))
+    media_service.update_media("alice", media_id, MediaUpdate(memory_id=None))
+    assert service.get_memory("alice", str(first.id)).media_ids == []
+    media_service.update_media("alice", media_id, MediaUpdate(memory_id=first.id))
+    assert service.get_memory("alice", str(first.id)).media_ids == [media_id]
     media_service.update_media("alice", media_id, MediaUpdate(memory_id=second.id))
     assert service.delete_memory("alice", str(first.id))
     assert (
@@ -637,6 +670,13 @@ def test_reverse_links_are_derived_for_all_memory_responses(
     assert service.get_memory("alice", str(second.id)).media_ids == [media_id]
     with pytest.raises(IdempotencyRecordDeletedError):
         service.create_memory("alice", "First", "fact", [], request_id=request_id)
+    linked_delete = str(
+        media_service.create_media("alice", MediaCreate(content_type="image/jpeg", size=4)).media.id
+    )
+    media_service.update_media("alice", linked_delete, MediaUpdate(memory_id=second.id))
+    assert service.get_memory("alice", str(second.id)).media_ids == [media_id, linked_delete]
+    media_service.delete_media("alice", linked_delete)
+    assert service.get_memory("alice", str(second.id)).media_ids == [media_id]
     assert service.delete_memory("alice", str(second.id))
     # Stored authority can retain the old ID, but no response exposes a dangling link.
     assert (
@@ -1039,3 +1079,69 @@ def test_maintenance_cli_is_bounded_and_sanitizes_storage_failures(
     with pytest.raises(SystemExit) as exc:
         maintain_media.main()
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("transport", [False, True])
+@pytest.mark.parametrize(
+    "action",
+    [
+        "create_profile",
+        "read_profile",
+        "list_profile",
+        "update_profile",
+        "replay_profile",
+        "read_reverse",
+        "delete",
+    ],
+)
+def test_shared_storage_error_is_also_safe_for_memory_http(
+    client: TestClient,
+    media_service: MediaService,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    transport: bool,
+) -> None:
+    request_id = uuid4()
+    memory = MemoryService(table=media_service.table).create_memory(
+        "alice", "Memory", "fact", [], request_id=request_id
+    )
+    error = (
+        EndpointConnectionError(endpoint_url="secret-internal-storage")
+        if transport
+        else ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "secret"}},
+            "DynamoDB",
+        )
+    )
+    original_get = media_service.table.get_item
+
+    def failed_profile(**kwargs: Any) -> Any:
+        if kwargs["Key"]["sk"] == "PROFILE":
+            raise error
+        return original_get(**kwargs)
+
+    if action == "read_reverse":
+        monkeypatch.setattr(media_service.table, "query", Mock(side_effect=error))
+    elif action == "delete":
+        monkeypatch.setattr(media_service.table, "delete_item", Mock(side_effect=error))
+    else:
+        monkeypatch.setattr(media_service.table, "get_item", failed_profile)
+    path = f"/api/memories/{memory.id}"
+    if action in {"create_profile", "replay_profile"}:
+        headers = auth()
+        if action == "replay_profile":
+            headers["Idempotency-Key"] = str(request_id)
+        response = client.post(
+            "/api/memories", headers=headers, json={"content": "Memory", "kind": "fact"}
+        )
+    elif action in {"read_profile", "read_reverse"}:
+        response = client.get(path, headers=auth())
+    elif action == "list_profile":
+        response = client.get("/api/memories", headers=auth())
+    elif action == "update_profile":
+        response = client.patch(path, headers=auth(), json={"content": "Changed"})
+    else:
+        response = client.delete(path, headers=auth())
+    assert response.status_code == 503
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {"detail": "Media storage is unavailable. Please try again."}
