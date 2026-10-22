@@ -169,7 +169,7 @@ class MediaService:
         )
         try:
             self.maintain(user_sub, limit=100)
-        except (StorageError, ValueError):
+        except StorageError, ValueError:
             logger.warning("media maintenance failed")
         return MediaUpload(
             media=self._to_medias([item], user_sub)[0],
