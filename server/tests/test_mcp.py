@@ -123,6 +123,19 @@ def tool_error(response: Response) -> str:
     return " ".join(part.get("text", "") for part in tool_result.get("content", []))
 
 
+def test_remember_is_blocked_while_account_is_deleting(mcp_client: tuple[McpClient, Any]) -> None:
+    mcp, table = mcp_client
+    table.put_item(Item={"pk": "USER#alice", "sk": "DELETING"})
+
+    assert tool_error(mcp.call("remember", {"content": "Do not save"})) == (
+        "Your Homie account is being deleted, so I can't save that."
+    )
+    assert MemoryService(table=table).list_memories("alice") == []
+    assert successful_content(
+        mcp.call("remember", {"content": "Bob's memory"}, token=mcp.token("bob"))
+    )
+
+
 def test_initialization_tool_schemas_and_endpoint_shape(mcp_client: tuple[McpClient, Any]) -> None:
     mcp, _ = mcp_client
     initialized = result(mcp.initialize())
@@ -439,7 +452,7 @@ def test_forget_invalid_ids_and_storage_failure_are_safe(
 @pytest.mark.parametrize(
     ("tool", "arguments", "operation"),
     [
-        ("remember", {"content": "Memory"}, "put_item"),
+        ("remember", {"content": "Memory"}, "transact_write_items"),
         ("recall", {"query": ""}, "query"),
         ("forget", {"memory_id": str(uuid4())}, "delete_item"),
     ],
@@ -462,7 +475,8 @@ def test_service_storage_errors_are_sanitized_mcp_tool_errors(
             operation,
         )
     )
-    monkeypatch.setattr(table, operation, Mock(side_effect=error))
+    target = table.meta.client if operation == "transact_write_items" else table
+    monkeypatch.setattr(target, operation, Mock(side_effect=error))
     response = mcp.call(tool, arguments)
     assert tool_error(response) == "Memory storage is unavailable. Please try again shortly."
     assert "secret" not in response.text
