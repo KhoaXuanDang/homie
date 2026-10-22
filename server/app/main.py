@@ -14,8 +14,9 @@ from starlette.requests import Request
 from app.config import settings
 from app.mcp_server import mcp, mcp_app
 from app.middleware.auth import McpAuthGate, RateLimiter
-from app.routes import health, memories
+from app.routes import health, me, memories
 from app.services.memory_service import (
+    AccountDeletingError,
     IdempotencyConflictError,
     IdempotencyInProgressError,
     IdempotencyRecordDeletedError,
@@ -64,6 +65,13 @@ async def idempotency_record_deleted(
 ) -> JSONResponse:
     return JSONResponse(
         status_code=410, content={"detail": "The memory created by this request was deleted."}
+    )
+
+
+@app.exception_handler(AccountDeletingError)
+async def account_deleting(request: Request, exc: AccountDeletingError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409, content={"detail": "Your account is being deleted. Try again later."}
     )
 
 
@@ -116,6 +124,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(memories.router)
+app.include_router(me.router)
 app.add_route("/mcp", mcp_app, methods=["GET", "POST", "DELETE"])
 
 
