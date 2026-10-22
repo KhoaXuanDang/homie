@@ -46,13 +46,6 @@ app.state.mcp_rate_limiter = RateLimiter(max_requests=60)
 app.state.media_rate_limiter = RateLimiter(max_requests=30)
 
 
-@app.exception_handler(AccountDeletingError)
-async def account_deleting(request: Request, exc: AccountDeletingError) -> JSONResponse:
-    return JSONResponse(
-        status_code=409, content={"detail": "Account deletion is in progress. Please try again."}
-    )
-
-
 @app.exception_handler(MediaNotFoundError)
 async def media_not_found(request: Request, exc: MediaNotFoundError) -> JSONResponse:
     return JSONResponse(status_code=404, content={"detail": "Media not found"})

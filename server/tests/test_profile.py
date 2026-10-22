@@ -104,6 +104,8 @@ def test_delete_me_removes_only_that_users_data(
     for user in ["alice", "bob"]:
         api.put("/api/me/profile", headers=auth(user), json={"timezone": "Asia/Tokyo"})
         api.post("/api/memories", headers=auth(user), json={"content": "Keys", "kind": "fact"})
+        for sk in ["MEDIA#pending", "MEDIA#uploaded", "MEDIA#deleting", "MAINTENANCE#media"]:
+            ddb_table.put_item(Item={"pk": f"USER#{user}", "sk": sk})
 
     assert api.delete("/api/me", headers=auth()).status_code == 204
 
@@ -119,6 +121,8 @@ def test_delete_me_removes_only_that_users_data(
     assert remaining == ["users/bob/media/3.jpg"]
     assert api.get("/api/me/profile", headers=auth("bob")).json()["timezone"] == "Asia/Tokyo"
     assert len(api.get("/api/memories", headers=auth("bob")).json()) == 1
+    for sk in ["MEDIA#pending", "MEDIA#uploaded", "MEDIA#deleting", "MAINTENANCE#media"]:
+        assert "Item" in ddb_table.get_item(Key={"pk": "USER#bob", "sk": sk})
     # Repeating the delete is a no-op.
     assert api.delete("/api/me", headers=auth()).status_code == 204
 
