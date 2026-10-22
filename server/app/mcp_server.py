@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, PlainValidator, ValidationError, Wit
 
 from app.config import settings
 from app.models.memory import Kind, MemoryCreate
-from app.services.memory_service import MemoryService
+from app.services.memory_service import AccountDeletingError, MemoryService
 from app.services.storage import StorageError
 
 _KINDS = get_args(Kind)
@@ -138,6 +138,8 @@ def remember(
         memory = MemoryService().create_memory(
             user_sub, data.content, data.kind, data.tags, data.event_id
         )
+    except AccountDeletingError as exc:
+        raise ToolError("Your Homie account is being deleted, so I can't save that.") from exc
     except (BotoCoreError, ClientError, StorageError) as exc:
         raise _storage_unavailable() from exc
     return ChangeResult(status="success", memory_id=str(memory.id))

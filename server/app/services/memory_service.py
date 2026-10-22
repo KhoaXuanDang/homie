@@ -61,11 +61,12 @@ class AccountDeletingError(Exception):
     pass
 
 
-# Marker item present while an account deletion is removing the user's records.
+# Marker item that exists while DELETE /api/me is wiping the user's records.
 DELETING_SK = "DELETING"
 
 
 def write_unless_deleting(table: Any, user_sub: str, items: list[dict[str, Any]]) -> None:
+    """Transact `items` only if the user's account is not being deleted."""
     check = {
         "ConditionCheck": {
             "TableName": table.name,
@@ -201,8 +202,10 @@ class MemoryService:
                 )
 
             try:
-                self.table.meta.client.transact_write_items(
-                    TransactItems=[
+                write_unless_deleting(
+                    self.table,
+                    user_sub,
+                    [
                         {
                             "Put": {
                                 "TableName": self.table.name,
@@ -217,7 +220,7 @@ class MemoryService:
                                 "ConditionExpression": "attribute_not_exists(pk)",
                             }
                         },
-                    ]
+                    ],
                 )
             except ClientError as exc:
                 if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
@@ -240,7 +243,9 @@ class MemoryService:
                     )
                 raise IdempotencyInProgressError("Request in progress, try again") from exc
         else:
-            self.table.put_item(Item=item)
+            write_unless_deleting(
+                self.table, user_sub, [{"Put": {"TableName": self.table.name, "Item": item}}]
+            )
         return self._to_memory(item, *self._timezone(user_sub))
 
     @staticmethod

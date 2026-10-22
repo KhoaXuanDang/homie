@@ -14,7 +14,7 @@ from starlette.requests import Request
 from app.config import settings
 from app.mcp_server import mcp, mcp_app
 from app.middleware.auth import McpAuthGate, RateLimiter
-from app.routes import health, media, memories
+from app.routes import health, me, media, memories
 from app.services.media_service import (
     MediaNotFoundError,
     MediaStorageError,
@@ -100,6 +100,13 @@ async def idempotency_record_deleted(
     )
 
 
+@app.exception_handler(AccountDeletingError)
+async def account_deleting(request: Request, exc: AccountDeletingError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409, content={"detail": "Your account is being deleted. Try again later."}
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
     errors = [
@@ -151,6 +158,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(memories.router)
 app.include_router(media.router)
+app.include_router(me.router)
 app.add_route("/mcp", mcp_app, methods=["GET", "POST", "DELETE"])
 
 
