@@ -103,6 +103,17 @@ async def internal_error(
         )
 
 
+@app.middleware("http")
+async def no_store_api(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    response = await call_next(request)
+    # Private data: browsers and the PWA service worker must never cache it (spec §9).
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 app.add_middleware(McpAuthGate)
 app.add_middleware(
     CORSMiddleware,
