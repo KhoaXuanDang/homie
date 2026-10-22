@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid7
@@ -27,6 +28,8 @@ from app.services.storage import (
     storage_errors,
     utc_timestamp,
 )
+
+logger = logging.getLogger(__name__)
 
 UPLOAD_EXPIRY = 300
 VIEW_EXPIRY = 900
@@ -166,8 +169,8 @@ class MediaService:
         )
         try:
             self.maintain(user_sub, limit=100)
-        except StorageError:
-            pass
+        except (StorageError, ValueError):
+            logger.warning("media maintenance failed")
         return MediaUpload(
             media=self._to_medias([item], user_sub)[0],
             upload_url=upload_url,

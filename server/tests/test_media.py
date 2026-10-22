@@ -302,16 +302,32 @@ def test_upload_rate_limit(media_client: TestClient) -> None:
     )
 
 
+@pytest.mark.parametrize("error_type", [MediaStorageError, ValueError])
 def test_create_advances_bounded_maintenance_best_effort(
-    media_service: MediaService, monkeypatch: pytest.MonkeyPatch
+    media_client: TestClient,
+    media_service: MediaService,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
 ) -> None:
-    maintain = Mock(side_effect=MediaStorageError)
+    maintain = Mock(side_effect=error_type("private checkpoint details"))
     monkeypatch.setattr(media_service, "maintain", maintain)
 
-    result = media_service.create_media("alice", MediaCreate(content_type="image/jpeg", size=4))
+    result = create(media_client)
 
-    assert result.media.status == "pending"
+    assert result["media"]["status"] == "pending"
+    assert result["upload_url"]
+    item = media_service.table.get_item(
+        Key={"pk": "USER#alice", "sk": f"MEDIA#{result['media']['id']}"}
+    )["Item"]
+    assert item["status"] == "pending"
     maintain.assert_called_once_with("alice", limit=100)
+    records = [record for record in caplog.records if record.name == "app.services.media_service"]
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+    assert records[0].getMessage() == "media maintenance failed"
+    assert records[0].exc_info is None
+    assert "private checkpoint details" not in caplog.text
 
 
 def test_cleanup_pending(media_client: TestClient, media_service: MediaService) -> None:
