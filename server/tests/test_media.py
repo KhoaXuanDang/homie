@@ -708,10 +708,10 @@ def test_reverse_links_are_derived_for_all_memory_responses(
     )
     assert service.get_memory("alice", str(first.id)).media_ids == [media_id]
     assert service.get_memory("alice", str(second.id)).media_ids == []
-    assert service.update_memory("alice", str(first.id), content="Edited").media_ids == [media_id]
-    assert service.create_memory("alice", "First", "fact", [], request_id=request_id).media_ids == [
-        media_id
-    ]
+    assert service.update_memory("alice", str(first.id), content="Edited").media_ids == []
+    assert (
+        service.create_memory("alice", "First", "fact", [], request_id=request_id).media_ids == []
+    )
     query = Mock(wraps=media_service.table.query)
     monkeypatch.setattr(media_service.table, "query", query)
     listed = service.list_memories("alice")
@@ -720,6 +720,13 @@ def test_reverse_links_are_derived_for_all_memory_responses(
         str(second.id): [],
     }
     assert query.call_count == 1
+    query.reset_mock()
+    assert service.update_memory("alice", str(first.id), content="Edited again").media_ids == []
+    query.assert_not_called()
+    assert (
+        service.create_memory("alice", "First", "fact", [], request_id=request_id).media_ids == []
+    )
+    query.assert_not_called()
     query.reset_mock()
     recalled = service.recall("alice", "First")
     assert recalled[0].media_ids == []

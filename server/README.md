@@ -86,9 +86,9 @@ cannot be supplied in create/update bodies. Empty/null updates are rejected.
 Content is trimmed and bounded to 1–2,000 characters; `kind` is one of
 `item_location`, `fact`, `preference`, or `todo`. Tags are at most 10 nonempty
 strings of up to 40 characters each, trimmed, lowercased, and deduplicated.
-Each memory has optional `event_id` and a `media_ids` list. Detail responses derive
-`media_ids` from linked media; list and recall responses return an empty list to avoid
-scanning the user's entire media partition. List supports
+Each memory has optional `event_id` and a `media_ids` list. `GET /api/memories/{id}`
+derives `media_ids` from linked media; list, recall, and mutation responses return
+an empty list to avoid scanning the user's entire media partition. List supports
 `kind`, best-first `q` keyword search, and `1 <= limit <= 200` (default 50),
 with newest memories as search tie-breakers. Recall falls back to newest memories
 when the query has no matches.

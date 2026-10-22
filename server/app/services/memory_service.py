@@ -304,7 +304,7 @@ class MemoryService:
         item = response.get("Item")
         if not item:
             raise MemoryNotFoundError("Memory not found")
-        return self._to_memories(user_sub, [item])[0]
+        return self._to_memories(user_sub, [item], include_media_ids=True)[0]
 
     def _read_memory_records(
         self, user_sub: str, *, limit: int | None = None
@@ -338,7 +338,7 @@ class MemoryService:
         return items[:_MAX_ITEMS]
 
     def _to_memories(
-        self, user_sub: str, records: list[dict[str, Any]], *, include_media_ids: bool = True
+        self, user_sub: str, records: list[dict[str, Any]], *, include_media_ids: bool = False
     ) -> list[Memory]:
         if not records:
             return []

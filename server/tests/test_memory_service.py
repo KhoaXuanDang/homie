@@ -392,7 +392,8 @@ def test_list_is_newest_first(service: MemoryService, ddb_table: Any) -> None:
     service.table.query = spy_query
     result = service.list_memories("alice", limit=10)
     assert [m.id for m in result] == [m.id for m in reversed(created)][:10]
-    assert limits == [10, 200]  # One memory page and one shared reverse-link page.
+    assert all(not memory.media_ids for memory in result)
+    assert limits == [10]  # Memory lists do not scan the media partition for links.
 
 
 def test_query_search_spans_dynamodb_pages(service: MemoryService, ddb_table: Any) -> None:

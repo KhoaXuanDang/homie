@@ -276,9 +276,10 @@ class MediaService:
                 ):
                     raise MemoryNotFoundError from exc
                 update_index = 1 if data.memory_id is not None else 0
-                if len(reasons) > update_index and reasons[update_index].get(
-                    "Code"
-                ) == "ConditionalCheckFailed":
+                if (
+                    len(reasons) > update_index
+                    and reasons[update_index].get("Code") == "ConditionalCheckFailed"
+                ):
                     raise MediaNotFoundError from exc
             raise
         return self._to_medias([item], user_sub)[0]
