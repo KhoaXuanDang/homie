@@ -86,7 +86,9 @@ cannot be supplied in create/update bodies. Empty/null updates are rejected.
 Content is trimmed and bounded to 1–2,000 characters; `kind` is one of
 `item_location`, `fact`, `preference`, or `todo`. Tags are at most 10 nonempty
 strings of up to 40 characters each, trimmed, lowercased, and deduplicated.
-Each memory has optional `event_id` and a `media_ids` list. List supports
+Each memory has optional `event_id` and a `media_ids` list. `GET /api/memories/{id}`
+derives `media_ids` from linked media; list, recall, and mutation responses return
+an empty list to avoid scanning the user's entire media partition. List supports
 `kind`, best-first `q` keyword search, and `1 <= limit <= 200` (default 50),
 with newest memories as search tie-breakers. Recall falls back to newest memories
 when the query has no matches.
@@ -117,7 +119,9 @@ Listing media never requires S3 ListBucket, HEAD or DeleteObject permissions.
   Missing objects or mismatched size/type return 409: restart with a new pending
   record and URL. S3 failures return a retryable 503, not a missing-object error.
 - `GET /api/media?limit=50` returns a newest-first array of uploaded media only
-  (`1 <= limit <= 200`). Each item includes `id`, `content_type`, `size`,
+  (`1 <= limit <= 200`), querying at most the newest 200 media records. If pending
+  or deleting records fill that page, the result may contain fewer than `limit`
+  uploaded items. Each item includes `id`, `content_type`, `size`,
   `caption`, `tags`, `memory_id`, `training_consent`, `status`, `url`, and
   `created_at` (in the profile timezone, UTC by default).
 - `PATCH /api/media/{id}` accepts one or more of `caption`, `tags`, `memory_id`,
@@ -158,7 +162,10 @@ untrusted HTTP body. Each invocation processes **one page**, evaluating at most
 `--limit` records or objects (`1..200`, default 100), including nonmatching records.
 The `MAINTENANCE#media` item in that user's partition persists phase and pagination
 progress across processes. Phases alternate between media records and S3 objects.
-Continue running after a completed cycle to catch later abandoned uploads.
+Continue running after a completed cycle to catch later abandoned uploads. Each
+successful `POST /api/media` also advances one bounded maintenance page for that
+user; cleanup failures do not fail the upload. This opportunistic pass does not
+replace scheduled runs for users who do not start another upload.
 Checkpoints advance only after successful page processing; failures exit nonzero
 with a sanitized retry message and can safely retry. Overlapping workers use
 conditional checkpoint writes; prefer one worker per subject.

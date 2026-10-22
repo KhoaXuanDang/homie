@@ -1,4 +1,3 @@
-from collections.abc import Iterator
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid7
@@ -18,6 +17,7 @@ from app.services.memory_service import (
     MemoryNotFoundError,
     get_table,
     utc_now,
+    write_unless_deleting,
 )
 from app.services.storage import (
     StorageError,
@@ -30,6 +30,7 @@ from app.services.storage import (
 
 UPLOAD_EXPIRY = 300
 VIEW_EXPIRY = 900
+_LIST_SCAN_LIMIT = 200
 _user_sub_adapter = TypeAdapter(UserSub)
 _limit_adapter = TypeAdapter(Limit)
 _EXTENSIONS = {
@@ -150,7 +151,23 @@ class MediaService:
             "created_at": utc_timestamp(utc_now()),
         }
         upload_url = self._presign("put_object", item, UPLOAD_EXPIRY)
-        self.table.put_item(Item=item, ConditionExpression="attribute_not_exists(pk)")
+        write_unless_deleting(
+            self.table,
+            user_sub,
+            [
+                {
+                    "Put": {
+                        "TableName": self.table.name,
+                        "Item": item,
+                        "ConditionExpression": "attribute_not_exists(pk)",
+                    }
+                }
+            ],
+        )
+        try:
+            self.maintain(user_sub, limit=100)
+        except StorageError:
+            pass
         return MediaUpload(
             media=self._to_medias([item], user_sub)[0],
             upload_url=upload_url,
@@ -171,6 +188,8 @@ class MediaService:
         except MediaStorageError as exc:
             cause = exc.__cause__
             if isinstance(cause, ClientError) and cause.response["Error"]["Code"] in {
+                "403",
+                "AccessDenied",
                 "404",
                 "NoSuchKey",
                 "NotFound",
@@ -194,31 +213,18 @@ class MediaService:
             raise
         return self._to_medias([item], user_sub)[0]
 
-    def _items(self, user_sub: str, **kwargs: Any) -> Iterator[dict[str, Any]]:
-        params = {
-            "KeyConditionExpression": Key("pk").eq(self._key(user_sub, "")["pk"])
-            & Key("sk").begins_with("MEDIA#"),
-            "ScanIndexForward": False,
-            "ConsistentRead": True,
-            "Limit": 200,
-            **kwargs,
-        }
-        while True:
-            page = self.table.query(**params)
-            yield from page.get("Items", [])
-            if not page.get("LastEvaluatedKey"):
-                break
-            params["ExclusiveStartKey"] = page["LastEvaluatedKey"]
-
     @storage_errors
     def list_media(self, user_sub: str, limit: int = 50) -> list[Media]:
         limit = _limit_adapter.validate_python(limit)
-        result = []
-        for item in self._items(user_sub, FilterExpression=Attr("status").eq("uploaded")):
-            result.append(item)
-            if len(result) == limit:
-                break
-        return self._to_medias(result, user_sub)
+        page = self.table.query(
+            KeyConditionExpression=Key("pk").eq(self._key(user_sub, "")["pk"])
+            & Key("sk").begins_with("MEDIA#"),
+            ScanIndexForward=False,
+            ConsistentRead=True,
+            Limit=_LIST_SCAN_LIMIT,
+            FilterExpression=Attr("status").eq("uploaded"),
+        )
+        return self._to_medias(page.get("Items", [])[:limit], user_sub)
 
     @storage_errors
     def update_media(self, user_sub: str, media_id: str, data: MediaUpdate) -> Media:
@@ -238,28 +244,24 @@ class MediaService:
                     ":uploaded": "uploaded",
                 },
             )
+            items = []
             if data.memory_id is not None:
-                self.table.meta.client.transact_write_items(
-                    TransactItems=[
-                        {
-                            "ConditionCheck": {
-                                "TableName": self.table.name,
-                                "Key": {
-                                    "pk": self._key(user_sub, "")["pk"],
-                                    "sk": f"MEM#{data.memory_id}",
-                                },
-                                "ConditionExpression": "attribute_exists(pk)",
-                            }
-                        },
-                        {"Update": {"TableName": self.table.name, **update}},
-                    ]
+                items.append(
+                    {
+                        "ConditionCheck": {
+                            "TableName": self.table.name,
+                            "Key": {
+                                "pk": self._key(user_sub, "")["pk"],
+                                "sk": f"MEM#{data.memory_id}",
+                            },
+                            "ConditionExpression": "attribute_exists(pk)",
+                        }
+                    }
                 )
-                item = self._get(user_sub, media_id)
-            else:
-                item = self.table.update_item(**update, ReturnValues="ALL_NEW")["Attributes"]
+            items.append({"Update": {"TableName": self.table.name, **update}})
+            write_unless_deleting(self.table, user_sub, items)
+            item = self._get(user_sub, media_id)
         except ClientError as exc:
-            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                raise MediaNotFoundError from exc
             if exc.response["Error"]["Code"] == "TransactionCanceledException":
                 reasons = exc.response.get("CancellationReasons", [])
                 if any(
@@ -267,9 +269,17 @@ class MediaService:
                     for reason in reasons
                 ):
                     raise
-                if reasons and reasons[0].get("Code") == "ConditionalCheckFailed":
+                if (
+                    data.memory_id is not None
+                    and reasons
+                    and reasons[0].get("Code") == "ConditionalCheckFailed"
+                ):
                     raise MemoryNotFoundError from exc
-                if len(reasons) > 1 and reasons[1].get("Code") == "ConditionalCheckFailed":
+                update_index = 1 if data.memory_id is not None else 0
+                if (
+                    len(reasons) > update_index
+                    and reasons[update_index].get("Code") == "ConditionalCheckFailed"
+                ):
                     raise MediaNotFoundError from exc
             raise
         return self._to_medias([item], user_sub)[0]

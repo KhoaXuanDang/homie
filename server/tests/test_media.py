@@ -8,6 +8,7 @@ from uuid import uuid4, uuid7
 import boto3
 import pytest
 import requests
+from boto3.dynamodb.conditions import Key
 from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
 from fastapi.testclient import TestClient
@@ -100,6 +101,31 @@ def test_pending_upload_contract(media_client: TestClient, media_service: MediaS
     assert media_client.get("/api/media", headers=auth()).json() == []
 
 
+def test_account_deletion_marker_blocks_media_writes(
+    media_client: TestClient, media_service: MediaService
+) -> None:
+    media_id = create(media_client)["media"]["id"]
+    media_service.table.put_item(Item={"pk": "USER#alice", "sk": "DELETING"})
+
+    created = media_client.post(
+        "/api/media",
+        headers=auth(),
+        json={"content_type": "image/jpeg", "size": 4},
+    )
+    assert created.status_code == 409
+    assert "upload_url" not in created.json()
+
+    updated = media_client.patch(
+        f"/api/media/{media_id}", headers=auth(), json={"caption": "Changed"}
+    )
+    assert updated.status_code == 409
+    assert media_service._get("alice", media_id)["caption"] == "Keys"
+    records = media_service.table.query(
+        KeyConditionExpression=Key("pk").eq("USER#alice") & Key("sk").begins_with("MEDIA#")
+    )["Items"]
+    assert len(records) == 1
+
+
 def test_complete_list_patch_delete(media_client: TestClient, media_service: MediaService) -> None:
     media_id = create(media_client)["media"]["id"]
     path = f"/api/media/{media_id}"
@@ -164,6 +190,27 @@ def test_complete_missing_or_mismatched_object(
     assert media_client.post(path, headers=auth()).status_code == 200
 
 
+def test_complete_head_forbidden_maps_to_upload_not_ready(
+    media_client: TestClient, media_service: MediaService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media_id = create(media_client)["media"]["id"]
+    monkeypatch.setattr(
+        media_service.s3,
+        "head_object",
+        Mock(
+            side_effect=ClientError(
+                {
+                    "Error": {"Code": "403", "Message": "Forbidden"},
+                    "ResponseMetadata": {"HTTPStatusCode": 403},
+                },
+                "HeadObject",
+            )
+        ),
+    )
+    response = media_client.post(f"/api/media/{media_id}/complete", headers=auth())
+    assert response.status_code == 409
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -179,7 +226,9 @@ def test_complete_missing_or_mismatched_object(
     ],
 )
 def test_invalid_create(media_client: TestClient, body: dict[str, Any]) -> None:
-    assert media_client.post("/api/media", headers=auth(), json=body).status_code == 422
+    response = media_client.post("/api/media", headers=auth(), json=body)
+    assert response.status_code == 422
+    assert "upload_url" not in response.json()
 
 
 @pytest.mark.parametrize(
@@ -251,6 +300,18 @@ def test_upload_rate_limit(media_client: TestClient) -> None:
         ).status_code
         == 201
     )
+
+
+def test_create_advances_bounded_maintenance_best_effort(
+    media_service: MediaService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    maintain = Mock(side_effect=MediaStorageError)
+    monkeypatch.setattr(media_service, "maintain", maintain)
+
+    result = media_service.create_media("alice", MediaCreate(content_type="image/jpeg", size=4))
+
+    assert result.media.status == "pending"
+    maintain.assert_called_once_with("alice", limit=100)
 
 
 def test_cleanup_pending(media_client: TestClient, media_service: MediaService) -> None:
@@ -379,7 +440,7 @@ def test_pagination_order_cleanup_boundary_and_timezone(
     item = upload(media_service, oldest)
     media_service.complete_media("alice", oldest)
     ids = []
-    # A full filtered-out page must not hide older uploaded or stale items.
+    # A full filtered-out page must not trigger another query on the read path.
     with media_service.table.batch_writer() as batch:
         for _ in range(201):
             media_id = str(uuid7())
@@ -404,7 +465,10 @@ def test_pagination_order_cleanup_boundary_and_timezone(
             UpdateExpression="SET created_at = :date",
             ExpressionAttributeValues={":date": created_at.isoformat()},
         )
-    assert [str(media.id) for media in media_service.list_media("alice", 1)] == [oldest]
+    query = Mock(wraps=media_service.table.query)
+    monkeypatch.setattr(media_service.table, "query", query)
+    assert media_service.list_media("alice", 1) == []
+    assert query.call_count == 1
     # Maintenance pages are bounded, even when all records fail a status filter.
     for _ in range(4):
         media_service.maintain("alice", 200)
@@ -417,7 +481,7 @@ def test_pagination_order_cleanup_boundary_and_timezone(
         Item={"pk": "USER#alice", "sk": "PROFILE", "timezone": "America/New_York"}
     )
     listed = media_service.list_media("alice", 2)
-    assert [str(media.id) for media in listed] == [newest, oldest]
+    assert [str(media.id) for media in listed] == [newest]
     assert listed[0].created_at.utcoffset() == timedelta(hours=-4)
 
 
@@ -504,6 +568,7 @@ def test_orphan_sweep_paginates_and_preserves_uploaded_media(
 def test_list_is_read_only_with_one_profile_and_one_link_batch(
     media_client: TestClient, media_service: MediaService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(media_service, "maintain", Mock())
     memory = MemoryService(table=media_service.table).create_memory("alice", "Keys", "fact", [])
     ids = []
     for _ in range(3):
@@ -643,18 +708,29 @@ def test_reverse_links_are_derived_for_all_memory_responses(
     )
     assert service.get_memory("alice", str(first.id)).media_ids == [media_id]
     assert service.get_memory("alice", str(second.id)).media_ids == []
-    assert service.update_memory("alice", str(first.id), content="Edited").media_ids == [media_id]
-    assert service.create_memory("alice", "First", "fact", [], request_id=request_id).media_ids == [
-        media_id
-    ]
+    assert service.update_memory("alice", str(first.id), content="Edited").media_ids == []
+    assert (
+        service.create_memory("alice", "First", "fact", [], request_id=request_id).media_ids == []
+    )
     query = Mock(wraps=media_service.table.query)
     monkeypatch.setattr(media_service.table, "query", query)
     listed = service.list_memories("alice")
     assert {str(memory.id): memory.media_ids for memory in listed} == {
-        str(first.id): [media_id],
+        str(first.id): [],
         str(second.id): [],
     }
-    assert query.call_count == 2  # Not one reverse query per returned memory.
+    assert query.call_count == 1
+    query.reset_mock()
+    assert service.update_memory("alice", str(first.id), content="Edited again").media_ids == []
+    query.assert_not_called()
+    assert (
+        service.create_memory("alice", "First", "fact", [], request_id=request_id).media_ids == []
+    )
+    query.assert_not_called()
+    query.reset_mock()
+    recalled = service.recall("alice", "First")
+    assert recalled[0].media_ids == []
+    assert query.call_count == 1
     with pytest.raises(MemoryNotFoundError):
         media_service.update_media("alice", media_id, MediaUpdate(memory_id=foreign.id))
     media_service.update_media("alice", media_id, MediaUpdate(memory_id=None))
@@ -777,6 +853,7 @@ def test_maintenance_bounded_persisted_pages_and_safe_checkpoints(
 ) -> None:
     for _ in range(9):
         media_service.create_media("alice", MediaCreate(content_type="image/jpeg", size=4))
+    media_service.table.delete_item(Key={"pk": "USER#alice", "sk": "MAINTENANCE#media"})
     query = Mock(wraps=media_service.table.query)
     monkeypatch.setattr(media_service.table, "query", query)
     first = media_service.maintain("alice", 4)
@@ -821,6 +898,7 @@ def test_maintenance_failed_delete_retries_without_advancing_checkpoint(
         UpdateExpression="SET created_at = :old",
         ExpressionAttributeValues={":old": "2000-01-01T00:00:00Z"},
     )
+    media_service.table.delete_item(Key={"pk": "USER#alice", "sk": "MAINTENANCE#media"})
     with monkeypatch.context() as patch:
         patch.setattr(
             media_service.s3,
@@ -842,6 +920,7 @@ def test_maintenance_cannot_overwrite_a_concurrent_checkpoint(
 ) -> None:
     for _ in range(3):
         media_service.create_media("alice", MediaCreate(content_type="image/jpeg", size=4))
+    media_service.table.delete_item(Key={"pk": "USER#alice", "sk": "MAINTENANCE#media"})
     media_service.maintain("alice", 1)
     key = {"pk": "USER#alice", "sk": "MAINTENANCE#media"}
     checkpoint = media_service.table.get_item(Key=key)["Item"]
@@ -891,12 +970,12 @@ def test_maintenance_checkpoints_empty_nonterminal_pages(
 @pytest.mark.parametrize(
     ("action", "operation"),
     [
-        ("create", "put_item"),
+        ("create", "transact_write_items"),
         ("list", "query"),
         ("profile", "get_item"),
         ("complete_read", "get_item"),
         ("complete_write", "update_item"),
-        ("update", "update_item"),
+        ("update", "transact_write_items"),
         ("link", "transact_write_items"),
         ("delete_read", "get_item"),
         ("delete_write", "update_item"),
@@ -922,6 +1001,8 @@ def test_dynamodb_failures_are_sanitized_and_retryable(
         media_service.complete_media("alice", media_id)
     if action == "linked_batch":
         media_service.update_media("alice", media_id, MediaUpdate(memory_id=memory.id))
+    if action.startswith("maintenance"):
+        media_service.table.delete_item(Key={"pk": "USER#alice", "sk": "MAINTENANCE#media"})
     error = (
         EndpointConnectionError(endpoint_url="secret-internal-storage")
         if transport
