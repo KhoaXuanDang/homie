@@ -21,6 +21,7 @@ from app.services.media_service import (
     UploadNotReadyError,
 )
 from app.services.memory_service import (
+    AccountDeletingError,
     IdempotencyConflictError,
     IdempotencyInProgressError,
     IdempotencyRecordDeletedError,
@@ -43,6 +44,13 @@ app = FastAPI(title="Homie API", lifespan=lifespan)
 app.state.api_rate_limiter = RateLimiter(max_requests=120)
 app.state.mcp_rate_limiter = RateLimiter(max_requests=60)
 app.state.media_rate_limiter = RateLimiter(max_requests=30)
+
+
+@app.exception_handler(AccountDeletingError)
+async def account_deleting(request: Request, exc: AccountDeletingError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409, content={"detail": "Account deletion is in progress. Please try again."}
+    )
 
 
 @app.exception_handler(MediaNotFoundError)

@@ -57,6 +57,31 @@ class IdempotencyRecordDeletedError(Exception):
     pass
 
 
+class AccountDeletingError(Exception):
+    pass
+
+
+# Marker item present while an account deletion is removing the user's records.
+DELETING_SK = "DELETING"
+
+
+def write_unless_deleting(table: Any, user_sub: str, items: list[dict[str, Any]]) -> None:
+    check = {
+        "ConditionCheck": {
+            "TableName": table.name,
+            "Key": {"pk": f"USER#{user_sub}", "sk": DELETING_SK},
+            "ConditionExpression": "attribute_not_exists(pk)",
+        }
+    }
+    try:
+        table.meta.client.transact_write_items(TransactItems=[*items, check])
+    except ClientError as exc:
+        reasons = exc.response.get("CancellationReasons", [])
+        if len(reasons) == len(items) + 1 and reasons[-1].get("Code") == "ConditionalCheckFailed":
+            raise AccountDeletingError("Account deletion in progress") from exc
+        raise
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -312,13 +337,23 @@ class MemoryService:
 
         return items[:_MAX_ITEMS]
 
-    def _to_memories(self, user_sub: str, records: list[dict[str, Any]]) -> list[Memory]:
+    def _to_memories(
+        self, user_sub: str, records: list[dict[str, Any]], *, include_media_ids: bool = True
+    ) -> list[Memory]:
         if not records:
             return []
         timezone, zone = self._timezone(user_sub)
-        links = memory_media_ids(self.table, user_sub, {record["id"] for record in records})
+        links = (
+            memory_media_ids(self.table, user_sub, {record["id"] for record in records})
+            if include_media_ids
+            else {}
+        )
         return [
-            self._to_memory({**record, "media_ids": links[record["id"]]}, timezone, zone)
+            self._to_memory(
+                {**record, "media_ids": links.get(record["id"], [])},
+                timezone,
+                zone,
+            )
             for record in records
         ]
 
@@ -343,7 +378,7 @@ class MemoryService:
             records = [record for record in records if record["kind"] == kind]
         if has_query:
             records = self._rank_records(records, query.strip())
-        return self._to_memories(user_sub, records[:limit])
+        return self._to_memories(user_sub, records[:limit], include_media_ids=False)
 
     @storage_errors
     def recall(
@@ -365,7 +400,7 @@ class MemoryService:
             ranked = self._rank_records(records, search_query)
             if ranked:
                 records = ranked
-        return self._to_memories(user_sub, records[:result_limit])
+        return self._to_memories(user_sub, records[:result_limit], include_media_ids=False)
 
     @storage_errors
     def update_memory(self, user_sub: str, memory_id: str, **updates: Any) -> Memory:
